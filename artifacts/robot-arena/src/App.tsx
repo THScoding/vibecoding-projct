@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { RobotTemplate } from "./game/types";
+import type { RobotSpec } from "./game/robots";
 import SelectionScreen from "./pages/SelectionScreen";
 import ArenaScreen from "./pages/ArenaScreen";
 
@@ -7,21 +7,28 @@ type Screen = "selection" | "arena";
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>("selection");
-  const [playerTemplate, setPlayerTemplate] = useState<RobotTemplate | null>(null);
+  const [playerSpec, setPlayerSpec] = useState<RobotSpec | null>(null);
+  const [opponentSpec, setOpponentSpec] = useState<RobotSpec | null>(null);
 
-  const handleSelect = (template: RobotTemplate) => {
-    setPlayerTemplate(template);
+  const handleFight = (player: RobotSpec, opponent: RobotSpec) => {
+    setPlayerSpec(player);
+    setOpponentSpec(opponent);
     setScreen("arena");
   };
 
   const handleExit = () => {
     setScreen("selection");
-    setPlayerTemplate(null);
   };
 
-  if (screen === "arena" && playerTemplate) {
-    return <ArenaScreen playerTemplate={playerTemplate} onExit={handleExit} />;
+  if (screen === "arena" && playerSpec && opponentSpec) {
+    return (
+      <ArenaScreen
+        playerSpec={playerSpec}
+        opponentSpec={opponentSpec}
+        onExit={handleExit}
+      />
+    );
   }
 
-  return <SelectionScreen onSelect={handleSelect} />;
+  return <SelectionScreen onFight={handleFight} />;
 }

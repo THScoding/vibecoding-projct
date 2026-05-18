@@ -1,400 +1,703 @@
-import type { GameState, RobotEntity, Bullet, Particle, Obstacle } from "./types";
-import { generateEnemyRobot } from "./robotGen";
+import type {
+  GameState,
+  RobotEntity,
+  ComponentSpec,
+  ComponentQuality,
+} from "./types";
+import {
+  componentStatus,
+  componentSpeedMult,
+  QUALITY_REDUCTION,
+  QUALITY_HP,
+} from "./types";
+import type { RobotSpec } from "./robots";
 
-const WALL = 20;
-const BULLET_COLORS: Record<string, Record<string, string>> = {
-  player: { cannon: "#00e5ff", shotgun: "#76ff03", laser: "#ea00ff" },
-  enemy: { cannon: "#ff3d00", shotgun: "#ffab00", laser: "#ff4081" },
-};
+// ── Constants ─────────────────────────────────────────────────────────────────
+const WALL = 24;
+const FRICTION = 0.86;
+const ANGULAR_FRICTION = 0.76;
+const KNOCKBACK_DECAY = 0.84;
+const MATCH_DURATION = 120;
+const COUNTDOWN_DURATION = 3;
 
-function uid() {
-  return Math.random().toString(36).slice(2, 10);
+// ── AI State ──────────────────────────────────────────────────────────────────
+type AiPhase = "spinup" | "charge" | "retreat" | "circle" | "approach" | "fire";
+
+interface AiState {
+  phase: AiPhase;
+  phaseTimer: number;
+  circleDir: 1 | -1;
+  retreatTimer: number;
+  lastRetreat: number;
 }
 
-function dist(ax: number, ay: number, bx: number, by: number) {
-  return Math.sqrt((ax - bx) ** 2 + (ay - by) ** 2);
+const AI_STATES = new WeakMap<RobotEntity, AiState>();
+
+function getAi(entity: RobotEntity): AiState {
+  if (!AI_STATES.has(entity)) {
+    AI_STATES.set(entity, {
+      phase: "spinup",
+      phaseTimer: 0,
+      circleDir: Math.random() > 0.5 ? 1 : -1,
+      retreatTimer: 0,
+      lastRetreat: 0,
+    });
+  }
+  return AI_STATES.get(entity)!;
 }
 
-function circleRect(cx: number, cy: number, r: number, obs: Obstacle) {
-  const nearX = Math.max(obs.x, Math.min(cx, obs.x + obs.w));
-  const nearY = Math.max(obs.y, Math.min(cy, obs.y + obs.h));
-  return (cx - nearX) ** 2 + (cy - nearY) ** 2 < r * r;
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function robotRadius(e: RobotEntity): number {
+  const { bodyWidth: w, bodyLength: l } = e.spec;
+  return Math.sqrt((w * 0.5) ** 2 + (l * 0.5) ** 2) * 0.72;
 }
 
-function spawnParticles(state: GameState, x: number, y: number, color: string, count = 10) {
+function makeComp(quality: ComponentQuality): ComponentSpec {
+  const hp = QUALITY_HP[quality];
+  return { quality, maxHP: hp, currentHP: hp };
+}
+
+function normAngle(a: number): number {
+  while (a > Math.PI) a -= 2 * Math.PI;
+  while (a < -Math.PI) a += 2 * Math.PI;
+  return a;
+}
+
+function steerTo(entity: RobotEntity, target: number, turn: number, dt: number) {
+  const diff = normAngle(target - entity.angle);
+  entity.angularVel += Math.sign(diff) * turn * dt * 7;
+}
+
+function thrust(entity: RobotEntity, spd: number, dt: number) {
+  entity.vx += Math.cos(entity.angle) * spd * dt;
+  entity.vy += Math.sin(entity.angle) * spd * dt;
+}
+
+// ── Particles ──────────────────────────────────────────────────────────────────
+function sparks(
+  state: GameState,
+  x: number,
+  y: number,
+  angle: number,
+  count: number,
+  intensity: number,
+) {
   for (let i = 0; i < count; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const speed = 60 + Math.random() * 160;
+    const a = angle + (Math.random() - 0.5) * Math.PI * 1.5;
+    const spd = (90 + Math.random() * 300) * Math.max(0.3, intensity);
     state.particles.push({
       x, y,
-      vx: Math.cos(angle) * speed,
-      vy: Math.sin(angle) * speed,
-      life: 0.4 + Math.random() * 0.4,
-      maxLife: 0.4 + Math.random() * 0.4,
-      color,
-      size: 2 + Math.random() * 4,
+      vx: Math.cos(a) * spd,
+      vy: Math.sin(a) * spd,
+      life: 0.18 + Math.random() * 0.45,
+      maxLife: 0.18 + Math.random() * 0.45,
+      color: Math.random() > 0.55 ? "#fff9c4" : Math.random() > 0.5 ? "#ffd54f" : "#ff7043",
+      size: 1.5 + Math.random() * 3,
+      type: "spark",
     });
   }
 }
 
-function fireBullet(state: GameState, entity: RobotEntity, owner: "player" | "enemy") {
-  const { template, x, y, turretAngle } = entity;
-  const now = performance.now() / 1000;
-  if (now - entity.lastShot < 1 / template.stats.fireRate) return;
-  entity.lastShot = now;
+function debris(state: GameState, x: number, y: number, color: string, count: number) {
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const spd = 35 + Math.random() * 110;
+    state.particles.push({
+      x, y,
+      vx: Math.cos(a) * spd,
+      vy: Math.sin(a) * spd,
+      life: 0.6 + Math.random() * 1.3,
+      maxLife: 0.6 + Math.random() * 1.3,
+      color,
+      size: 2.5 + Math.random() * 5.5,
+      type: "debris",
+    });
+  }
+}
 
-  const w = template.weapon;
-  const bs = template.stats.bulletSpeed;
-  const color = BULLET_COLORS[owner][w];
-  const baseAngle = turretAngle;
+function smoke(state: GameState, x: number, y: number, count = 1) {
+  for (let i = 0; i < count; i++) {
+    state.particles.push({
+      x: x + (Math.random() - 0.5) * 20,
+      y: y + (Math.random() - 0.5) * 20,
+      vx: (Math.random() - 0.5) * 18,
+      vy: -15 - Math.random() * 20,
+      life: 1.2 + Math.random() * 1.0,
+      maxLife: 1.2 + Math.random() * 1.0,
+      color: `rgba(${80 + Math.random() * 60|0},${80 + Math.random() * 60|0},${80 + Math.random() * 60|0},0.45)`,
+      size: 11 + Math.random() * 16,
+      type: "smoke",
+    });
+  }
+}
 
-  const createBullet = (angle: number, dmgMult = 1): Bullet => ({
-    id: uid(),
-    x, y,
-    vx: Math.cos(angle) * bs,
-    vy: Math.sin(angle) * bs,
-    damage: template.stats.damage * dmgMult,
-    owner,
-    ttl: w === "laser" ? 0.25 : w === "shotgun" ? 0.35 : 0.6,
-    maxTtl: w === "laser" ? 0.25 : w === "shotgun" ? 0.35 : 0.6,
-    weapon: w,
-    size: w === "laser" ? 3 : w === "shotgun" ? 4 : 5,
-    color,
+// ── Weapon Update ──────────────────────────────────────────────────────────────
+function updateWeapon(entity: RobotEntity, dt: number) {
+  const { spec } = entity;
+  entity.hammerCooldown = Math.max(0, entity.hammerCooldown - dt);
+
+  if (spec.weaponType === "hammer") {
+    if (entity.hammerState === "striking") {
+      entity.hammerTimer -= dt;
+      entity.hammerAngle = Math.min(Math.PI * 0.5, entity.hammerAngle + Math.PI * 3.8 * dt);
+      if (entity.hammerTimer <= 0) { entity.hammerState = "retracting"; entity.hammerTimer = 0.5; }
+    } else if (entity.hammerState === "retracting") {
+      entity.hammerTimer -= dt;
+      entity.hammerAngle = Math.max(-Math.PI * 0.6, entity.hammerAngle - Math.PI * 2.2 * dt);
+      if (entity.hammerTimer <= 0) { entity.hammerState = "ready"; entity.hammerAngle = -Math.PI * 0.6; }
+    }
+    return;
+  }
+
+  if (spec.maxWeaponRPM > 0) {
+    const disabled = componentStatus(entity.weapon) === "disabled";
+    if (disabled) {
+      entity.weaponRPM = Math.max(0, entity.weaponRPM - spec.weaponSpinupRate * 2.5 * dt);
+    } else {
+      const cap = spec.maxWeaponRPM * (entity.weapon.currentHP / entity.weapon.maxHP);
+      const target = entity.weaponThrottle * cap;
+      if (entity.weaponRPM < target) {
+        entity.weaponRPM = Math.min(target, entity.weaponRPM + spec.weaponSpinupRate * dt);
+      } else {
+        entity.weaponRPM = Math.max(target, entity.weaponRPM - spec.weaponSpinupRate * 0.4 * dt);
+      }
+    }
+  }
+}
+
+// ── Physics ────────────────────────────────────────────────────────────────────
+function applyPhysics(entity: RobotEntity, arenaW: number, arenaH: number, dt: number) {
+  const maxVel = entity.spec.maxSpeed * 2.2;
+
+  // Integrate knockback
+  entity.vx += entity.knockbackVx;
+  entity.vy += entity.knockbackVy;
+  entity.knockbackVx *= KNOCKBACK_DECAY;
+  entity.knockbackVy *= KNOCKBACK_DECAY;
+
+  // Clamp velocity
+  const vel = Math.sqrt(entity.vx ** 2 + entity.vy ** 2);
+  if (vel > maxVel) { entity.vx = (entity.vx / vel) * maxVel; entity.vy = (entity.vy / vel) * maxVel; }
+
+  entity.x += entity.vx * dt;
+  entity.y += entity.vy * dt;
+  entity.angle += entity.angularVel * dt;
+
+  entity.vx *= FRICTION;
+  entity.vy *= FRICTION;
+  entity.angularVel *= ANGULAR_FRICTION;
+
+  // Wall bounce
+  const r = robotRadius(entity) + WALL;
+  if (entity.x < r) { entity.x = r; entity.vx = Math.abs(entity.vx) * 0.45; }
+  if (entity.x > arenaW - r) { entity.x = arenaW - r; entity.vx = -Math.abs(entity.vx) * 0.45; }
+  if (entity.y < r) { entity.y = r; entity.vy = Math.abs(entity.vy) * 0.45; }
+  if (entity.y > arenaH - r) { entity.y = arenaH - r; entity.vy = -Math.abs(entity.vy) * 0.45; }
+}
+
+// ── Hit Location ───────────────────────────────────────────────────────────────
+type HitLoc = "front" | "left" | "right" | "rear";
+
+function hitLocation(attacker: RobotEntity, defender: RobotEntity): HitLoc {
+  const dx = attacker.x - defender.x;
+  const dy = attacker.y - defender.y;
+  const fX = Math.cos(defender.angle);
+  const fY = Math.sin(defender.angle);
+  const rX = -Math.sin(defender.angle);
+  const rY = Math.cos(defender.angle);
+  const fwd = dx * fX + dy * fY;
+  const side = dx * rX + dy * rY;
+  const fa = Math.abs(fwd);
+  const sa = Math.abs(side);
+  if (sa > fa * 1.1) return side > 0 ? "right" : "left";
+  return fwd > 0 ? "front" : "rear";
+}
+
+// ── Collision & Damage ─────────────────────────────────────────────────────────
+function applySpinnerHit(
+  state: GameState,
+  attacker: RobotEntity,
+  defender: RobotEntity,
+  rpmPct: number,
+  nx: number,
+  ny: number,
+  now: number,
+  cx: number,
+  cy: number,
+) {
+  if (now < defender.hitFlashUntil) return;
+
+  const ke = attacker.spec.weaponKE * rpmPct;
+  const armorRed = QUALITY_REDUCTION[defender.armor.quality];
+  const loc = hitLocation(attacker, defender);
+
+  // Armor always takes damage
+  let armorDmg = ke * 0.38 * (1 - armorRed);
+  // Component damage
+  const compDmg = ke * 0.26 * (1 - armorRed);
+
+  if (loc === "front") {
+    defender.weapon.currentHP = Math.max(0, defender.weapon.currentHP - compDmg);
+  } else if (loc === "left" || loc === "right") {
+    defender.drive.currentHP = Math.max(0, defender.drive.currentHP - compDmg);
+  } else {
+    // Rear hit — bonus armor damage
+    armorDmg *= 1.35;
+    defender.drive.currentHP = Math.max(0, defender.drive.currentHP - compDmg * 0.5);
+  }
+
+  // Weapon type modifiers
+  let kbMult = 1.0;
+  if (attacker.spec.weaponType === "horizontal_spinner") { kbMult = 1.6; armorDmg *= 1.1; }
+  else if (attacker.spec.weaponType === "vertical_spinner") { kbMult = 0.75; armorDmg *= 1.25; }
+  else if (attacker.spec.weaponType === "drum") { kbMult = 0.65; }
+
+  defender.armor.currentHP = Math.max(0, defender.armor.currentHP - armorDmg);
+  defender.totalDamageTaken += armorDmg + compDmg;
+
+  // Knockback
+  const kbSpd = (ke * 2.8 * kbMult) / defender.spec.mass;
+  defender.knockbackVx = nx * kbSpd;
+  defender.knockbackVy = ny * kbSpd;
+  defender.hitFlashUntil = now + 130;
+  defender.lastHitAngle = Math.atan2(ny, nx);
+
+  // Weapon loses energy proportional to opponent armor
+  attacker.weaponRPM *= Math.max(0, 1 - (0.35 + (1 - armorRed) * 0.25));
+
+  // Attacker recoil
+  attacker.vx -= nx * kbSpd * 0.38;
+  attacker.vy -= ny * kbSpd * 0.38;
+
+  // Effects
+  sparks(state, cx, cy, Math.atan2(ny, nx), 14 + Math.round(ke * 0.25), rpmPct);
+  if (armorDmg > 6) debris(state, cx, cy, defender.spec.primaryColor, Math.round(armorDmg * 0.18 + 2));
+  if (componentStatus(defender.armor) === "critical") smoke(state, defender.x, defender.y);
+
+  if (defender.armor.currentHP <= 0) {
+    defender.isAlive = false;
+    sparks(state, defender.x, defender.y, 0, 50, 1);
+    debris(state, defender.x, defender.y, defender.spec.primaryColor, 18);
+    smoke(state, defender.x, defender.y, 4);
+  }
+}
+
+function applyHammerHit(
+  state: GameState,
+  attacker: RobotEntity,
+  defender: RobotEntity,
+  now: number,
+  cx: number,
+  cy: number,
+) {
+  if (now < defender.hitFlashUntil) return;
+  if (attacker.hammerAngle < Math.PI * 0.2) return; // only near peak swing
+
+  const ke = attacker.spec.weaponKE;
+  const armorRed = QUALITY_REDUCTION[defender.armor.quality];
+  const wepRed = QUALITY_REDUCTION[attacker.weapon.quality];
+
+  let dmg = ke * 0.6 * (1 - armorRed) * (1 + wepRed * 0.6);
+  // AP penetration for titanium-quality hammers
+  if (attacker.weapon.quality === "titanium") {
+    dmg *= 1.25;
+    const r = Math.random();
+    if (r < 0.35) defender.drive.currentHP = Math.max(0, defender.drive.currentHP - dmg * 0.35);
+    else if (r < 0.65) defender.weapon.currentHP = Math.max(0, defender.weapon.currentHP - dmg * 0.35);
+  }
+
+  defender.armor.currentHP = Math.max(0, defender.armor.currentHP - dmg);
+  defender.totalDamageTaken += dmg;
+  defender.hitFlashUntil = now + 110;
+
+  const angle = Math.atan2(defender.y - attacker.y, defender.x - attacker.x);
+  sparks(state, cx, cy, angle, 10, 0.65);
+  debris(state, cx, cy, "#607d8b", 4);
+
+  if (defender.armor.currentHP <= 0) {
+    defender.isAlive = false;
+    sparks(state, defender.x, defender.y, 0, 40, 1);
+    debris(state, defender.x, defender.y, defender.spec.primaryColor, 14);
+    smoke(state, defender.x, defender.y, 3);
+  }
+}
+
+function applyLifterHit(
+  state: GameState,
+  attacker: RobotEntity,
+  defender: RobotEntity,
+  nx: number,
+  ny: number,
+  now: number,
+  _cx: number,
+  _cy: number,
+) {
+  if (now < defender.hitFlashUntil) return;
+  if (attacker.weaponThrottle < 0.4) return;
+
+  const pushSpd = 200 / defender.spec.mass;
+  defender.knockbackVx = nx * pushSpd;
+  defender.knockbackVy = ny * pushSpd;
+  defender.hitFlashUntil = now + 80;
+
+  const dmg = attacker.spec.weaponKE * 0.12;
+  defender.armor.currentHP = Math.max(0, defender.armor.currentHP - dmg);
+  defender.totalDamageTaken += dmg;
+
+  sparks(state, _cx, _cy, Math.atan2(ny, nx), 5, 0.3);
+}
+
+function checkCollision(state: GameState) {
+  const { player: p, opponent: o } = state;
+  const rp = robotRadius(p);
+  const ro = robotRadius(o);
+  const dx = o.x - p.x;
+  const dy = o.y - p.y;
+  const d = Math.sqrt(dx * dx + dy * dy);
+  const minD = rp + ro;
+  if (d >= minD || d < 1) return;
+
+  const nx = dx / d;
+  const ny = dy / d;
+  const overlap = minD - d;
+  p.x -= nx * overlap * 0.5;
+  p.y -= ny * overlap * 0.5;
+  o.x += nx * overlap * 0.5;
+  o.y += ny * overlap * 0.5;
+
+  const now = performance.now();
+  const cx = (p.x + o.x) * 0.5;
+  const cy = (p.y + o.y) * 0.5;
+
+  const pRpm = p.spec.maxWeaponRPM > 0 ? p.weaponRPM / p.spec.maxWeaponRPM : 0;
+  const oRpm = o.spec.maxWeaponRPM > 0 ? o.weaponRPM / o.spec.maxWeaponRPM : 0;
+
+  if (pRpm > 0.05) applySpinnerHit(state, p, o, pRpm, nx, ny, now, cx, cy);
+  if (oRpm > 0.05) applySpinnerHit(state, o, p, oRpm, -nx, -ny, now, cx, cy);
+
+  if (p.hammerState === "striking") applyHammerHit(state, p, o, now, cx, cy);
+  if (o.hammerState === "striking") applyHammerHit(state, o, p, now, cx, cy);
+
+  if (p.spec.weaponType === "lifter") applyLifterHit(state, p, o, nx, ny, now, cx, cy);
+  if (o.spec.weaponType === "lifter") applyLifterHit(state, o, p, -nx, -ny, now, cx, cy);
+
+  // Physical impulse (always)
+  const rv = (p.vx - o.vx) * nx + (p.vy - o.vy) * ny;
+  if (rv < 0) {
+    const imp = rv * 0.55;
+    p.vx -= imp * nx; p.vy -= imp * ny;
+    o.vx += imp * nx; o.vy += imp * ny;
+  }
+}
+
+// ── AI Driving ────────────────────────────────────────────────────────────────
+function wallAvoidAngle(e: RobotEntity, W: number, H: number): number | null {
+  const m = 110;
+  let ax = 0, ay = 0;
+  if (e.x < m) ax += 1;
+  if (e.x > W - m) ax -= 1;
+  if (e.y < m) ay += 1;
+  if (e.y > H - m) ay -= 1;
+  return ax !== 0 || ay !== 0 ? Math.atan2(ay, ax) : null;
+}
+
+function updateOpponentAI(
+  state: GameState,
+  entity: RobotEntity,
+  target: RobotEntity,
+  dt: number,
+) {
+  const ai = getAi(entity);
+  ai.phaseTimer += dt;
+
+  const { spec } = entity;
+  const dx = target.x - entity.x;
+  const dy = target.y - entity.y;
+  const d = Math.sqrt(dx * dx + dy * dy);
+  const toTarget = Math.atan2(dy, dx);
+  const dm = componentSpeedMult(entity.drive);
+  const spd = spec.maxSpeed * dm;
+  const trn = spec.turnRate * dm;
+  const isSpinner = spec.maxWeaponRPM > 0 && spec.weaponType !== "lifter";
+  const rpmPct = spec.maxWeaponRPM > 0 ? entity.weaponRPM / spec.maxWeaponRPM : 0;
+
+  // Always spin up if spinner
+  if (isSpinner) entity.weaponThrottle = 1;
+
+  // ── AGGRESSIVE (horizontal_spinner, drum) ──
+  if (spec.drivingStyle === "aggressive" && isSpinner) {
+    if (ai.phase === "retreat") {
+      ai.retreatTimer -= dt;
+      steerTo(entity, toTarget + Math.PI, trn, dt);
+      thrust(entity, -spd * 0.65, dt);
+      if (ai.retreatTimer <= 0) { ai.phase = "spinup"; ai.phaseTimer = 0; }
+
+    } else if (ai.phase === "spinup") {
+      // Stay ~280 away, spin up
+      if (d < 260) { steerTo(entity, toTarget + Math.PI, trn, dt); thrust(entity, -spd * 0.5, dt); }
+      else steerTo(entity, toTarget + 0.4, trn, dt);
+      if (rpmPct >= 0.72) { ai.phase = "charge"; ai.phaseTimer = 0; }
+
+    } else if (ai.phase === "charge") {
+      steerTo(entity, toTarget, trn, dt);
+      thrust(entity, spd, dt);
+      if (rpmPct < 0.25 && d > 120) { ai.phase = "retreat"; ai.retreatTimer = 1.2; }
+    } else { ai.phase = "spinup"; }
+  }
+
+  // ── AGGRESSIVE (vertical_spinner) ──
+  else if (spec.drivingStyle === "aggressive" && spec.weaponType === "vertical_spinner") {
+    if (ai.phase === "retreat") {
+      ai.retreatTimer -= dt;
+      steerTo(entity, toTarget + Math.PI, trn, dt);
+      thrust(entity, -spd * 0.6, dt);
+      if (ai.retreatTimer <= 0) { ai.phase = "spinup"; ai.phaseTimer = 0; }
+    } else if (ai.phase === "spinup") {
+      if (d < 240) thrust(entity, -spd * 0.3, dt);
+      if (rpmPct >= 0.6) { ai.phase = "charge"; ai.phaseTimer = 0; }
+    } else {
+      // Face opponent, charge
+      steerTo(entity, toTarget, trn, dt);
+      thrust(entity, spd * 0.9, dt);
+      if (rpmPct < 0.2) { ai.phase = "retreat"; ai.retreatTimer = 1.5; }
+    }
+  }
+
+  // ── CONTROL (hammer bots) ──
+  else if (spec.drivingStyle === "control" && spec.weaponType === "hammer") {
+    entity.weaponThrottle = 1;
+    if (ai.phase === "fire") {
+      ai.phaseTimer += dt;
+      if (ai.phaseTimer > 0.6) { ai.phase = "approach"; ai.phaseTimer = 0; }
+    } else {
+      steerTo(entity, toTarget, trn, dt);
+      applyApproach(entity, spd, d, 100, dt);
+      if (d < 90 && entity.hammerCooldown <= 0 && componentStatus(entity.weapon) !== "disabled") {
+        entity.hammerState = "striking";
+        entity.hammerTimer = 0.18;
+        entity.hammerAngle = -Math.PI * 0.6;
+        entity.hammerCooldown = spec.id === "beta" ? 2.2 : 1.6;
+        ai.phase = "fire"; ai.phaseTimer = 0;
+      }
+    }
+  }
+
+  // ── CONTROL (lifter) ──
+  else if (spec.drivingStyle === "control" && spec.weaponType === "lifter") {
+    steerTo(entity, toTarget, trn, dt);
+    applyApproach(entity, spd, d, 80, dt);
+    entity.weaponThrottle = d < 100 ? 1 : 0;
+  }
+
+  // ── OPPORTUNISTIC (Whiplash) ──
+  else if (spec.drivingStyle === "opportunistic") {
+    entity.weaponThrottle = 1;
+    if (ai.phase === "retreat") {
+      ai.retreatTimer -= dt;
+      steerTo(entity, toTarget + Math.PI * 0.9, trn, dt);
+      thrust(entity, -spd * 0.75, dt);
+      if (ai.retreatTimer <= 0) { ai.phase = "circle"; ai.phaseTimer = 0; ai.circleDir = (ai.circleDir * -1) as 1 | -1; }
+    } else if (ai.phase === "circle") {
+      const circ = toTarget + (Math.PI / 2) * ai.circleDir;
+      steerTo(entity, circ, trn, dt);
+      thrust(entity, spd * 0.78, dt);
+      if (ai.phaseTimer > 1.8) { ai.phase = rpmPct > 0.55 ? "charge" : "spinup"; ai.phaseTimer = 0; }
+    } else if (ai.phase === "spinup") {
+      steerTo(entity, toTarget + 0.5 * ai.circleDir, trn, dt);
+      if (rpmPct > 0.6) { ai.phase = "charge"; ai.phaseTimer = 0; }
+    } else {
+      steerTo(entity, toTarget, trn, dt);
+      thrust(entity, spd, dt);
+      if (d < 90 || rpmPct < 0.2) { ai.phase = "retreat"; ai.retreatTimer = 1.0; }
+    }
+  } else {
+    // Fallback
+    steerTo(entity, toTarget, trn, dt);
+    applyApproach(entity, spd, d, 120, dt);
+  }
+
+  // Wall avoidance
+  const wa = wallAvoidAngle(entity, state.arenaW, state.arenaH);
+  if (wa !== null) steerTo(entity, wa, trn * 0.7, dt);
+}
+
+function applyApproach(entity: RobotEntity, spd: number, d: number, closeRange: number, dt: number) {
+  if (d > closeRange) thrust(entity, spd * 0.85, dt);
+  else thrust(entity, spd * 0.3, dt);
+}
+
+// ── Player Input ───────────────────────────────────────────────────────────────
+function updatePlayerInput(state: GameState, entity: RobotEntity, dt: number) {
+  const { keys } = state;
+  const dm = componentSpeedMult(entity.drive);
+  const spd = entity.spec.maxSpeed * dm;
+  const trn = entity.spec.turnRate * dm;
+
+  const fwd = (keys.has("w") || keys.has("arrowup")) ? 1
+    : (keys.has("s") || keys.has("arrowdown")) ? -1 : 0;
+  const rot = (keys.has("d") || keys.has("arrowright")) ? 1
+    : (keys.has("a") || keys.has("arrowleft")) ? -1 : 0;
+
+  if (fwd) thrust(entity, spd * fwd, dt);
+  if (rot) entity.angularVel += trn * rot * dt * 7;
+
+  const weaponInput = keys.has("shift") || state.mouseDown;
+  if (weaponInput) entity.weaponThrottle = Math.min(1, entity.weaponThrottle + dt * 1.8);
+  else entity.weaponThrottle = Math.max(0, entity.weaponThrottle - dt * 1.0);
+
+  // Fire hammer
+  if (
+    (entity.spec.weaponType === "hammer") &&
+    weaponInput &&
+    entity.hammerState === "ready" &&
+    entity.hammerCooldown <= 0 &&
+    componentStatus(entity.weapon) !== "disabled"
+  ) {
+    entity.hammerState = "striking";
+    entity.hammerTimer = 0.18;
+    entity.hammerAngle = -Math.PI * 0.6;
+    entity.hammerCooldown = entity.spec.id === "beta" ? 2.2 : 1.6;
+  }
+}
+
+// ── Win / Match ────────────────────────────────────────────────────────────────
+function robotScore(e: RobotEntity): number {
+  return (
+    (e.armor.currentHP / e.armor.maxHP) * 60 +
+    (e.drive.currentHP / e.drive.maxHP) * 25 +
+    (e.weapon.currentHP / e.weapon.maxHP) * 15
+  );
+}
+
+function checkWinConditions(state: GameState) {
+  const { match, player: p, opponent: o } = state;
+  if (match.phase !== "fighting") return;
+
+  const pDead = !p.isAlive || p.armor.currentHP <= 0;
+  const oDead = !o.isAlive || o.armor.currentHP <= 0;
+  if (pDead) { match.phase = "ended"; match.winner = "opponent"; match.winReason = "KO — your chassis was destroyed!"; return; }
+  if (oDead) { match.phase = "ended"; match.winner = "player"; match.winReason = `KO — ${o.spec.name} destroyed!`; return; }
+
+  const pImm = componentStatus(p.drive) === "disabled";
+  const oImm = componentStatus(o.drive) === "disabled";
+  if (pImm && !oImm) { match.phase = "ended"; match.winner = "opponent"; match.winReason = "Immobility — drive system destroyed!"; return; }
+  if (oImm && !pImm) { match.phase = "ended"; match.winner = "player"; match.winReason = `Immobility — ${o.spec.name} can't move!`; return; }
+
+  if (match.timeRemaining <= 0) {
+    const ps = robotScore(p);
+    const os = robotScore(o);
+    match.phase = "ended";
+    if (ps > os + 2) { match.winner = "player"; match.winReason = `Judge's decision — ${ps.toFixed(0)} vs ${os.toFixed(0)} pts`; }
+    else if (os > ps + 2) { match.winner = "opponent"; match.winReason = `Judge's decision — ${os.toFixed(0)} vs ${ps.toFixed(0)} pts`; }
+    else { match.winner = "draw"; match.winReason = "Draw — too close to call!"; }
+  }
+}
+
+function updateDamageSmokeEffects(state: GameState, dt: number) {
+  for (const e of [state.player, state.opponent]) {
+    if (!e.isAlive) continue;
+    const status = componentStatus(e.armor);
+    if (status === "critical" && Math.random() < dt * 6) smoke(state, e.x, e.y);
+    if (status === "disabled" && Math.random() < dt * 15) smoke(state, e.x, e.y, 2);
+  }
+}
+
+// ── Build State ────────────────────────────────────────────────────────────────
+export function buildInitialState(
+  playerSpec: RobotSpec,
+  opponentSpec: RobotSpec,
+): GameState {
+  const arenaW = 860;
+  const arenaH = 860;
+
+  const makeEntity = (spec: RobotSpec, x: number, y: number, angle: number): RobotEntity => ({
+    spec,
+    x, y, angle,
+    vx: 0, vy: 0, angularVel: 0,
+    armor: makeComp(spec.armorQuality),
+    drive: makeComp(spec.driveQuality),
+    weapon: makeComp(spec.weaponQuality),
+    weaponRPM: 0,
+    weaponThrottle: 0,
+    hammerState: "ready",
+    hammerAngle: -Math.PI * 0.6,
+    hammerTimer: 0,
+    hammerCooldown: 0,
+    knockbackVx: 0, knockbackVy: 0,
+    hitFlashUntil: 0,
+    lastHitAngle: 0,
+    isAlive: true,
+    totalDamageTaken: 0,
   });
 
-  if (w === "shotgun") {
-    for (let i = -2; i <= 2; i++) {
-      const spread = (i * 0.12) + (Math.random() - 0.5) * 0.08;
-      state.bullets.push(createBullet(baseAngle + spread, 0.75));
-    }
-  } else if (w === "laser") {
-    state.bullets.push(createBullet(baseAngle + (Math.random() - 0.5) * 0.03));
-  } else {
-    state.bullets.push(createBullet(baseAngle + (Math.random() - 0.5) * 0.04));
-  }
-
-  spawnParticles(state, x, y, color, 4);
-}
-
-function updatePlayerAI(state: GameState, dt: number, canvasW: number, canvasH: number) {
-  const p = state.player;
-  const spd = p.template.stats.speed;
-  const { keys, mouseX, mouseY, cameraX, cameraY } = state;
-
-  const camX = Math.max(0, Math.min(cameraX, state.arenaW - canvasW));
-  const camY = Math.max(0, Math.min(cameraY, state.arenaH - canvasH));
-
-  const worldMouseX = mouseX + camX;
-  const worldMouseY = mouseY + camY;
-
-  let vx = 0, vy = 0;
-  if (keys.has("w") || keys.has("arrowup")) vy -= spd;
-  if (keys.has("s") || keys.has("arrowdown")) vy += spd;
-  if (keys.has("a") || keys.has("arrowleft")) vx -= spd;
-  if (keys.has("d") || keys.has("arrowright")) vx += spd;
-
-  if (vx !== 0 && vy !== 0) {
-    vx *= 0.707;
-    vy *= 0.707;
-  }
-
-  p.turretAngle = Math.atan2(worldMouseY - p.y, worldMouseX - p.x);
-
-  if (vx !== 0 || vy !== 0) {
-    p.angle = Math.atan2(vy, vx);
-  }
-
-  const nx = p.x + vx * dt;
-  const ny = p.y + vy * dt;
-  const r = p.template.stats.size;
-
-  const inWall = (x: number, y: number) =>
-    x < WALL + r || x > state.arenaW - WALL - r || y < WALL + r || y > state.arenaH - WALL - r;
-
-  const hitObs = (x: number, y: number) =>
-    state.obstacles.some((o) => circleRect(x, y, r + 2, o));
-
-  if (!inWall(nx, p.y) && !hitObs(nx, p.y)) p.x = nx;
-  if (!inWall(p.x, ny) && !hitObs(p.x, ny)) p.y = ny;
-
-  if (state.mouseDown) {
-    fireBullet(state, p, "player");
-  }
-
-  state.cameraX = p.x - canvasW / 2;
-  state.cameraY = p.y - canvasH / 2;
-}
-
-function updateEnemyAI(state: GameState, enemy: RobotEntity, dt: number) {
-  const { player } = state;
-  const d = dist(enemy.x, enemy.y, player.x, player.y);
-  const spd = enemy.template.stats.speed;
-  const r = enemy.template.stats.size;
-
-  const sightRange = 480;
-  const attackRange = 280;
-  const retreatRange = 80;
-
-  if (d < retreatRange) {
-    enemy.aiState = "retreat";
-  } else if (d < sightRange) {
-    enemy.aiState = d < attackRange ? "attack" : "chase";
-  } else {
-    enemy.aiState = "patrol";
-  }
-
-  let vx = 0, vy = 0;
-
-  if (enemy.aiState === "patrol") {
-    enemy.patrolTimer -= dt;
-    if (enemy.patrolTimer <= 0 || dist(enemy.x, enemy.y, enemy.patrolTargetX, enemy.patrolTargetY) < 20) {
-      enemy.patrolTargetX = WALL + 60 + Math.random() * (state.arenaW - WALL * 2 - 120);
-      enemy.patrolTargetY = WALL + 60 + Math.random() * (state.arenaH - WALL * 2 - 120);
-      enemy.patrolTimer = 2 + Math.random() * 3;
-    }
-    const dx = enemy.patrolTargetX - enemy.x;
-    const dy = enemy.patrolTargetY - enemy.y;
-    const len = Math.sqrt(dx * dx + dy * dy);
-    if (len > 5) {
-      vx = (dx / len) * spd * 0.6;
-      vy = (dy / len) * spd * 0.6;
-    }
-    enemy.turretAngle = enemy.angle;
-  } else if (enemy.aiState === "chase") {
-    const dx = player.x - enemy.x;
-    const dy = player.y - enemy.y;
-    const len = Math.sqrt(dx * dx + dy * dy);
-    vx = (dx / len) * spd;
-    vy = (dy / len) * spd;
-    enemy.turretAngle = Math.atan2(dy, dx);
-  } else if (enemy.aiState === "attack") {
-    const dx = player.x - enemy.x;
-    const dy = player.y - enemy.y;
-    const len = Math.sqrt(dx * dx + dy * dy);
-    enemy.turretAngle = Math.atan2(dy, dx) + (Math.random() - 0.5) * 0.08;
-
-    const perpX = -dy / len;
-    const perpY = dx / len;
-    const strafe = Math.sin(state.time * 1.8) > 0 ? 1 : -1;
-    vx = perpX * spd * 0.55 * strafe;
-    vy = perpY * spd * 0.55 * strafe;
-
-    fireBullet(state, enemy, "enemy");
-  } else if (enemy.aiState === "retreat") {
-    const dx = enemy.x - player.x;
-    const dy = enemy.y - player.y;
-    const len = Math.sqrt(dx * dx + dy * dy);
-    vx = (dx / len) * spd * 0.8;
-    vy = (dy / len) * spd * 0.8;
-    enemy.turretAngle = Math.atan2(player.y - enemy.y, player.x - enemy.x);
-    fireBullet(state, enemy, "enemy");
-  }
-
-  if (vx !== 0 || vy !== 0) {
-    if (vx !== 0 && vy !== 0) { vx *= 0.707; vy *= 0.707; }
-    enemy.angle = Math.atan2(vy, vx);
-  }
-
-  const nx = enemy.x + vx * dt;
-  const ny = enemy.y + vy * dt;
-
-  const inWall = (x: number, y: number) =>
-    x < WALL + r || x > state.arenaW - WALL - r || y < WALL + r || y > state.arenaH - WALL - r;
-  const hitObs = (x: number, y: number) =>
-    state.obstacles.some((o) => circleRect(x, y, r + 2, o));
-
-  if (!inWall(nx, enemy.y) && !hitObs(nx, enemy.y)) enemy.x = nx;
-  if (!inWall(enemy.x, ny) && !hitObs(enemy.x, ny)) enemy.y = ny;
-}
-
-function updateBullets(state: GameState, dt: number) {
-  const toRemove = new Set<string>();
-
-  for (const b of state.bullets) {
-    b.ttl -= dt;
-    if (b.ttl <= 0) { toRemove.add(b.id); continue; }
-
-    b.x += b.vx * dt;
-    b.y += b.vy * dt;
-
-    if (b.x < WALL || b.x > state.arenaW - WALL || b.y < WALL || b.y > state.arenaH - WALL) {
-      spawnParticles(state, b.x, b.y, b.color, 4);
-      toRemove.add(b.id);
-      continue;
-    }
-
-    if (state.obstacles.some((o) => circleRect(b.x, b.y, b.size, o))) {
-      spawnParticles(state, b.x, b.y, b.color, 5);
-      toRemove.add(b.id);
-      continue;
-    }
-
-    const now = performance.now();
-
-    if (b.owner === "player") {
-      for (const enemy of state.enemies) {
-        if (dist(b.x, b.y, enemy.x, enemy.y) < enemy.template.stats.size + b.size) {
-          const dmg = b.damage * (1 - enemy.template.stats.armor);
-          enemy.health = Math.max(0, enemy.health - dmg);
-          enemy.invincibleUntil = now + 80;
-          spawnParticles(state, b.x, b.y, b.color, 8);
-          toRemove.add(b.id);
-          if (enemy.health <= 0) {
-            state.score += Math.round(50 * (1 + state.wave * 0.2));
-            spawnParticles(state, enemy.x, enemy.y, enemy.template.glowColor, 30);
-          }
-          break;
-        }
-      }
-    } else {
-      const p = state.player;
-      if (now > p.invincibleUntil && dist(b.x, b.y, p.x, p.y) < p.template.stats.size + b.size) {
-        const dmg = b.damage * (1 - p.template.stats.armor);
-        p.health = Math.max(0, p.health - dmg);
-        p.invincibleUntil = now + 200;
-        spawnParticles(state, b.x, b.y, b.color, 8);
-        toRemove.add(b.id);
-      }
-    }
-  }
-
-  state.bullets = state.bullets.filter((b) => !toRemove.has(b.id));
-}
-
-function updateParticles(state: GameState, dt: number) {
-  for (const p of state.particles) {
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
-    p.vx *= 0.92;
-    p.vy *= 0.92;
-    p.life -= dt;
-  }
-  state.particles = state.particles.filter((p) => p.life > 0);
-}
-
-function spawnWave(state: GameState, wave: number) {
-  const count = 2 + wave;
-  const padding = 120;
-  const positions = [
-    { x: state.arenaW * 0.8, y: state.arenaH * 0.2 },
-    { x: state.arenaW * 0.2, y: state.arenaH * 0.8 },
-    { x: state.arenaW * 0.8, y: state.arenaH * 0.8 },
-    { x: state.arenaW * 0.2, y: state.arenaH * 0.2 },
-    { x: state.arenaW * 0.5, y: state.arenaH * 0.1 },
-    { x: state.arenaW * 0.5, y: state.arenaH * 0.9 },
-  ];
-
-  for (let i = 0; i < count; i++) {
-    const template = generateEnemyRobot(wave, i);
-    const pos = positions[i % positions.length];
-    const jitter = () => (Math.random() - 0.5) * padding;
-    state.enemies.push({
-      template,
-      x: Math.max(WALL + 40, Math.min(state.arenaW - WALL - 40, pos.x + jitter())),
-      y: Math.max(WALL + 40, Math.min(state.arenaH - WALL - 40, pos.y + jitter())),
-      angle: Math.random() * Math.PI * 2,
-      turretAngle: 0,
-      health: template.stats.maxHealth,
-      lastShot: 0,
-      invincibleUntil: 0,
-      aiState: "patrol",
-      patrolTargetX: state.arenaW / 2,
-      patrolTargetY: state.arenaH / 2,
-      patrolTimer: 0,
-    });
-  }
-}
-
-export function buildInitialState(
-  playerTemplate: import("./types").RobotTemplate,
-  canvasW: number,
-  canvasH: number,
-): GameState {
-  const arenaW = 1800;
-  const arenaH = 1400;
-
-  const obstacles: Obstacle[] = [
-    { x: 300, y: 300, w: 120, h: 80 },
-    { x: arenaW - 420, y: 300, w: 120, h: 80 },
-    { x: 300, y: arenaH - 380, w: 120, h: 80 },
-    { x: arenaW - 420, y: arenaH - 380, w: 120, h: 80 },
-    { x: arenaW / 2 - 80, y: 220, w: 160, h: 70 },
-    { x: arenaW / 2 - 80, y: arenaH - 290, w: 160, h: 70 },
-    { x: 220, y: arenaH / 2 - 50, w: 70, h: 100 },
-    { x: arenaW - 290, y: arenaH / 2 - 50, w: 70, h: 100 },
-    { x: arenaW / 2 - 200, y: arenaH / 2 - 60, w: 100, h: 120 },
-    { x: arenaW / 2 + 100, y: arenaH / 2 - 60, w: 100, h: 120 },
-    { x: arenaW / 2 - 50, y: arenaH / 2 + 80, w: 100, h: 60 },
-  ];
-
-  const state: GameState = {
-    player: {
-      template: playerTemplate,
-      x: arenaW / 2,
-      y: arenaH / 2,
-      angle: -Math.PI / 2,
-      turretAngle: -Math.PI / 2,
-      health: playerTemplate.stats.maxHealth,
-      lastShot: 0,
-      invincibleUntil: 0,
-      aiState: "patrol",
-      patrolTargetX: 0,
-      patrolTargetY: 0,
-      patrolTimer: 0,
-    },
-    enemies: [],
-    bullets: [],
+  return {
+    player: makeEntity(playerSpec, arenaW * 0.22, arenaH * 0.5, 0),
+    opponent: makeEntity(opponentSpec, arenaW * 0.78, arenaH * 0.5, Math.PI),
     particles: [],
-    obstacles,
-    cameraX: arenaW / 2 - canvasW / 2,
-    cameraY: arenaH / 2 - canvasH / 2,
     arenaW,
     arenaH,
-    wave: 1,
-    score: 0,
+    match: {
+      phase: "countdown",
+      timeRemaining: MATCH_DURATION,
+      countdownTimer: COUNTDOWN_DURATION,
+      winner: null,
+      winReason: "",
+    },
     keys: new Set(),
-    mouseX: canvasW / 2,
-    mouseY: canvasH / 2,
+    mouseX: 0, mouseY: 0,
     mouseDown: false,
-    phase: "playing",
+    cameraX: 0, cameraY: 0,
     time: 0,
   };
-
-  spawnWave(state, 1);
-  return state;
 }
 
-export function updateGame(
-  state: GameState,
-  dt: number,
-  canvasW: number,
-  canvasH: number,
-): GameState {
-  if (state.phase !== "playing") return state;
+// ── Main Update ────────────────────────────────────────────────────────────────
+export function updateGame(state: GameState, dt: number): GameState {
+  const clampedDt = Math.min(dt, 0.04);
+  state.time += clampedDt;
 
-  state.time += dt;
+  const { match } = state;
 
-  updatePlayerAI(state, dt, canvasW, canvasH);
-
-  for (const enemy of state.enemies) {
-    updateEnemyAI(state, enemy, dt);
+  if (match.phase === "countdown") {
+    match.countdownTimer -= clampedDt;
+    if (match.countdownTimer <= 0) match.phase = "fighting";
+    return state;
   }
 
-  updateBullets(state, dt);
-  updateParticles(state, dt);
+  if (match.phase === "ended") return state;
 
-  state.enemies = state.enemies.filter((e) => e.health > 0);
+  match.timeRemaining = Math.max(0, match.timeRemaining - clampedDt);
 
-  if (state.player.health <= 0) {
-    state.phase = "defeat";
-  } else if (state.enemies.length === 0) {
-    state.wave += 1;
-    state.player.health = Math.min(
-      state.player.template.stats.maxHealth,
-      state.player.health + state.player.template.stats.maxHealth * 0.3,
-    );
-    spawnWave(state, state.wave);
+  // Input
+  updatePlayerInput(state, state.player, clampedDt);
+  updateOpponentAI(state, state.opponent, state.player, clampedDt);
+
+  // Weapons
+  updateWeapon(state.player, clampedDt);
+  updateWeapon(state.opponent, clampedDt);
+
+  // Physics
+  applyPhysics(state.player, state.arenaW, state.arenaH, clampedDt);
+  applyPhysics(state.opponent, state.arenaW, state.arenaH, clampedDt);
+
+  // Collision & damage
+  checkCollision(state);
+
+  // Particles
+  for (const p of state.particles) {
+    p.x += p.vx * clampedDt;
+    p.y += p.vy * clampedDt;
+    if (p.type === "spark") { p.vx *= 0.88; p.vy *= 0.88; }
+    else if (p.type === "debris") { p.vx *= 0.94; p.vy *= 0.94; }
+    p.life -= clampedDt;
   }
+  state.particles = state.particles.filter((p) => p.life > 0);
+
+  // Smoke from damage
+  updateDamageSmokeEffects(state, clampedDt);
+
+  // Win check
+  checkWinConditions(state);
 
   return state;
 }
