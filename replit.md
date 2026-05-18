@@ -1,45 +1,52 @@
-# [Project name]
+# Robot Arena
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+A 2D top-down combat robot game where you choose from procedurally generated bots and fight AI opponents in a neon-lit arena.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `pnpm --filter @workspace/robot-arena run dev` — run the game (port 23186)
+- `pnpm --filter @workspace/api-server run dev` — run the API server (port 8080)
 - `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
 
 ## Stack
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- Game: React + HTML Canvas (requestAnimationFrame loop)
+- Frontend: Vite + React
+- No backend needed for core game
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `artifacts/robot-arena/src/game/types.ts` — all shared types
+- `artifacts/robot-arena/src/game/robotGen.ts` — procedural robot generation
+- `artifacts/robot-arena/src/game/engine.ts` — game loop, physics, AI, bullets
+- `artifacts/robot-arena/src/game/renderer.ts` — canvas rendering
+- `artifacts/robot-arena/src/pages/SelectionScreen.tsx` — robot picker
+- `artifacts/robot-arena/src/pages/ArenaScreen.tsx` — combat arena
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Pure canvas-based rendering (no game engine library) for maximum control
+- Seeded PRNG for reproducible robot generation from numeric seeds
+- Game state is a plain mutable ref — no React state in the game loop
+- Enemy AI uses finite state machine: patrol → chase → attack → retreat
+- Wave-based progression: each cleared wave spawns more and stronger enemies
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+- Selection screen: 6 procedurally generated robots with unique stats, shapes, colors, weapons, and lore
+- "Regenerate Roster" button for fresh random robots
+- Arena: top-down combat, WASD movement, mouse aim turret, left-click to fire
+- Three weapon types: Cannon (high damage, medium fire rate), Shotgun (spread shot), Laser (rapid fire)
+- Three body shapes: Square (Quad), Hexagon (Hex), Triangle (Tri)
+- AI enemies with patrol/chase/attack/retreat behavior
+- Particle effects, health bars, score tracking, wave counter
+- Victory/defeat overlay with restart
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- Game uses WASD for movement, mouse for aiming, left-click to shoot
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
-
-## Pointers
-
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+- Do not run `pnpm dev` at the workspace root — use workflow restart or filter flag
