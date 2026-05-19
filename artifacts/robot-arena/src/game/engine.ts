@@ -19,11 +19,109 @@ const ANGULAR_FRICTION = 0.80;
 const KNOCKBACK_DECAY = 0.88;
 const MATCH_DURATION = 120;
 const COUNTDOWN_DURATION = 3;
-// Robot's "front" is local -y direction in canvas space.
-// In world space that maps to (sin(angle), -cos(angle)).
-// THRUST_SCALE converts spec.maxSpeed into realistic pixel/s terminal velocity.
 const THRUST_SCALE = 16;
 const ANGULAR_SCALE = 14;
+
+// ── Rotational KE & Impact Physics ────────────────────────────────────────────
+//
+// A spinning weapon bar rotating about its center stores kinetic energy:
+//   KE = ½Iω²
+//   where I = (1/12) × m_weapon × L²   (moment of inertia, uniform bar)
+//   and   ω = 2π × RPM / 60             (angular velocity, rad/s)
+//
+// At impact the weapon tip has tangential velocity:
+//   v_tip = ω × (L/2)
+//
+// The "effective mass" at the tip — how much of the weapon mass participates
+// in the collision impulse — comes from Lagrangian mechanics:
+//   m_eff = I / r²  where r = L/2  →  m_eff = m_weapon / 3
+//
+// Impulse delivered to defender (with steel-on-steel restitution e ≈ 0.55):
+//   J = m_eff × v_tip × (1 + e) × rpmPct
+//     = (m_weapon/3) × (ω × L/2) × 1.55 × rpmPct
+//
+// Knockback of defender: Δv = J / m_defender
+//
+// ── Direction Decomposition ───────────────────────────────────────────────────
+// The force direction is NOT purely along the collision normal. The weapon tip's
+// velocity vector determines the impulse direction:
+//   worldBarAngle = weaponBarAngle + entity.angle   (bar orientation in world)
+//   tipDir = (−sin(worldBarAngle), cos(worldBarAngle))  (CCW tip velocity)
+//   dotN   = tipDir · normal    → normal (pushback) component fraction
+//   dotT   = tipDir · tangent   → tangential (throw) component fraction
+//
+// Weapon-type mixing ratios:
+//   horizontal_spinner: 40% normal, 60% tangential  — signature sideways throw
+//   vertical_spinner:   65% normal, 35% tangential
+//   drum:               80% normal, 20% tangential  — rapid, forward hits
+//
+// Damage scales with |dotN|^0.5: glancing hits do ~30% damage with full throw,
+// direct hits do 100% damage with mostly pushback.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Weapon mass fraction and bar half-length (game units, approximate)
+const WEAPON_MASS_FRAC = 0.18; // weapon ≈ 18% of total robot mass
+// Restitution for steel-on-steel impact
+const RESTITUTION = 0.55;
+
+function weaponImpulse(attacker: RobotEntity, rpmPct: number): number {
+  const { spec } = attacker;
+  const mWeapon = spec.mass * WEAPON_MASS_FRAC;
+  // Approximate bar half-length from body geometry
+  const L2 = spec.weaponType === "horizontal_spinner"
+    ? spec.bodyWidth * 0.6 + 12  // bar extends past body width
+    : spec.weaponType === "drum"
+    ? spec.bodyWidth * 0.44
+    : spec.bodyWidth * 0.45;     // vertical disc radius
+  const omega = (spec.maxWeaponRPM * 2 * Math.PI / 60) * rpmPct;
+  const mEff = mWeapon / 3;
+  const vTip = omega * L2;
+  return mEff * vTip * (1 + RESTITUTION) * rpmPct;
+}
+
+function impactKnockbackDir(
+  attacker: RobotEntity,
+  nx: number,
+  ny: number,
+): [number, number] {
+  const { spec } = attacker;
+  const worldBarAngle = attacker.weaponBarAngle + attacker.angle;
+  // Tip velocity direction (CCW rotation)
+  const txDir = -Math.sin(worldBarAngle);
+  const tyDir = Math.cos(worldBarAngle);
+
+  const dotN = txDir * nx + tyDir * ny;
+  const dotT = txDir * (-ny) + tyDir * nx;
+
+  // Mixing ratios by weapon type
+  let normalMix: number, tangentMix: number;
+  if (spec.weaponType === "horizontal_spinner") {
+    normalMix = 0.40; tangentMix = 0.60;
+  } else if (spec.weaponType === "drum") {
+    normalMix = 0.80; tangentMix = 0.20;
+  } else {
+    // vertical_spinner
+    normalMix = 0.65; tangentMix = 0.35;
+  }
+
+  const kbX = nx * normalMix * dotN + (-ny) * tangentMix * dotT;
+  const kbY = ny * normalMix * dotN + nx * tangentMix * dotT;
+  const mag = Math.sqrt(kbX * kbX + kbY * kbY);
+  // Ensure direction always pushes defender away (fallback to pure normal)
+  if (mag < 0.05) return [nx, ny];
+  return [kbX / mag, kbY / mag];
+}
+
+// Glancing vs direct hit: scales damage 0.3–1.0 based on how square the hit is
+function impactDamageScale(attacker: RobotEntity, nx: number, ny: number): number {
+  const worldBarAngle = attacker.weaponBarAngle + attacker.angle;
+  const txDir = -Math.sin(worldBarAngle);
+  const tyDir = Math.cos(worldBarAngle);
+  const dotN = Math.abs(txDir * nx + tyDir * ny);
+  // Glancing blow (dotN≈0) → 0.3x damage, full throw
+  // Direct hit    (dotN≈1) → 1.0x damage, pushback
+  return 0.30 + dotN * 0.70;
+}
 
 // ── AI State ──────────────────────────────────────────────────────────────────
 type AiPhase = "spinup" | "charge" | "retreat" | "circle" | "approach" | "fire";
@@ -68,19 +166,14 @@ function normAngle(a: number): number {
   return a;
 }
 
-// Robot front is local -y → world direction (sin(angle), -cos(angle)).
-// Equivalent world-space atan2 angle = PI/2 - entity.angle (offset by -PI/2 from entity.angle).
-// So to steer toward a world-space direction `target` (atan2 convention),
-// the entity.angle that achieves that facing = PI/2 - target → diff = (PI/2 - target) - entity.angle.
-// Equivalently diff = normAngle(-(target - PI/2) - entity.angle)... simpler: subtract PI/2 from target in the diff:
+// Robot front is local -y → world (sin(angle), -cos(angle)).
+// steerTo adjusts entity.angle toward the world-space atan2 direction `target`.
 function steerTo(entity: RobotEntity, target: number, turn: number, dt: number) {
-  // Convert world atan2 target to required entity.angle
   const requiredAngle = Math.PI / 2 - target;
   const diff = normAngle(requiredAngle - entity.angle);
   entity.angularVel += Math.sign(diff) * turn * dt * ANGULAR_SCALE;
 }
 
-// Drive forward: robot front is (sin(angle), -cos(angle)) in world space.
 function thrust(entity: RobotEntity, spd: number, dt: number) {
   entity.vx += Math.sin(entity.angle) * spd * dt * THRUST_SCALE;
   entity.vy += -Math.cos(entity.angle) * spd * dt * THRUST_SCALE;
@@ -89,21 +182,19 @@ function thrust(entity: RobotEntity, spd: number, dt: number) {
 // ── Particles ──────────────────────────────────────────────────────────────────
 function sparks(
   state: GameState,
-  x: number,
-  y: number,
+  x: number, y: number,
   angle: number,
   count: number,
   intensity: number,
 ) {
   for (let i = 0; i < count; i++) {
-    const a = angle + (Math.random() - 0.5) * Math.PI * 1.5;
-    const spd = (120 + Math.random() * 380) * Math.max(0.3, intensity);
+    const a = angle + (Math.random() - 0.5) * Math.PI * 1.6;
+    const spd = (140 + Math.random() * 420) * Math.max(0.3, intensity);
     state.particles.push({
       x, y,
-      vx: Math.cos(a) * spd,
-      vy: Math.sin(a) * spd,
-      life: 0.12 + Math.random() * 0.38,
-      maxLife: 0.12 + Math.random() * 0.38,
+      vx: Math.cos(a) * spd, vy: Math.sin(a) * spd,
+      life: 0.10 + Math.random() * 0.35,
+      maxLife: 0.10 + Math.random() * 0.35,
       color: Math.random() > 0.55 ? "#fff9c4" : Math.random() > 0.5 ? "#ffd54f" : "#ff7043",
       size: 1.5 + Math.random() * 3,
       type: "spark",
@@ -114,15 +205,14 @@ function sparks(
 function debris(state: GameState, x: number, y: number, color: string, count: number) {
   for (let i = 0; i < count; i++) {
     const a = Math.random() * Math.PI * 2;
-    const spd = 50 + Math.random() * 160;
+    const spd = 60 + Math.random() * 180;
     state.particles.push({
       x, y,
-      vx: Math.cos(a) * spd,
-      vy: Math.sin(a) * spd,
-      life: 0.7 + Math.random() * 1.4,
-      maxLife: 0.7 + Math.random() * 1.4,
+      vx: Math.cos(a) * spd, vy: Math.sin(a) * spd,
+      life: 0.8 + Math.random() * 1.5,
+      maxLife: 0.8 + Math.random() * 1.5,
       color,
-      size: 2.5 + Math.random() * 5.5,
+      size: 3 + Math.random() * 6,
       type: "debris",
     });
   }
@@ -131,17 +221,63 @@ function debris(state: GameState, x: number, y: number, color: string, count: nu
 function smoke(state: GameState, x: number, y: number, count = 1) {
   for (let i = 0; i < count; i++) {
     state.particles.push({
-      x: x + (Math.random() - 0.5) * 20,
-      y: y + (Math.random() - 0.5) * 20,
-      vx: (Math.random() - 0.5) * 18,
-      vy: -15 - Math.random() * 20,
-      life: 1.2 + Math.random() * 1.0,
-      maxLife: 1.2 + Math.random() * 1.0,
+      x: x + (Math.random() - 0.5) * 22,
+      y: y + (Math.random() - 0.5) * 22,
+      vx: (Math.random() - 0.5) * 16,
+      vy: -14 - Math.random() * 22,
+      life: 1.2 + Math.random() * 1.1,
+      maxLife: 1.2 + Math.random() * 1.1,
       color: `rgba(${80 + Math.random() * 60 | 0},${80 + Math.random() * 60 | 0},${80 + Math.random() * 60 | 0},0.45)`,
-      size: 11 + Math.random() * 16,
+      size: 12 + Math.random() * 18,
       type: "smoke",
     });
   }
+}
+
+// ── Part Destruction Events ────────────────────────────────────────────────────
+// Called once when a component first drops to zero.
+function triggerWeaponDestruction(state: GameState, entity: RobotEntity) {
+  if (entity.destroyedParts.weapon) return;
+  entity.destroyedParts.weapon = true;
+  entity.weaponRPM = 0;
+  // Big explosion of sparks from the weapon position
+  const frontX = entity.x + Math.sin(entity.angle) * entity.spec.bodyLength * 0.55;
+  const frontY = entity.y - Math.cos(entity.angle) * entity.spec.bodyLength * 0.55;
+  sparks(state, frontX, frontY, Math.atan2(frontY - entity.y, frontX - entity.x), 30, 1);
+  debris(state, frontX, frontY, entity.spec.accentColor, 10);
+  smoke(state, frontX, frontY, 3);
+}
+
+function triggerTrackDestruction(
+  state: GameState,
+  entity: RobotEntity,
+  side: "left" | "right" | "both",
+) {
+  const w = entity.spec.bodyWidth;
+  // Track positions in local space → world
+  const localSides: [number, number][] = side === "both"
+    ? [[-w / 2 - 8, 0], [w / 2 + 8, 0]]
+    : side === "left"
+    ? [[-w / 2 - 8, 0]]
+    : [[w / 2 + 8, 0]];
+
+  for (const [lx, ly] of localSides) {
+    const wx = entity.x + lx * Math.cos(entity.angle) - ly * Math.sin(entity.angle);
+    const wy = entity.y + lx * Math.sin(entity.angle) + ly * Math.cos(entity.angle);
+    sparks(state, wx, wy, Math.random() * Math.PI * 2, 14, 0.8);
+    debris(state, wx, wy, "#222", 6);
+    smoke(state, wx, wy, 2);
+  }
+
+  if (side === "left" || side === "both") entity.destroyedParts.leftTrack = true;
+  if (side === "right" || side === "both") entity.destroyedParts.rightTrack = true;
+}
+
+function triggerArmorBreach(state: GameState, entity: RobotEntity) {
+  if (entity.destroyedParts.armorBreached) return;
+  entity.destroyedParts.armorBreached = true;
+  sparks(state, entity.x, entity.y, 0, 20, 0.9);
+  smoke(state, entity.x, entity.y, 2);
 }
 
 // ── Weapon Update ──────────────────────────────────────────────────────────────
@@ -175,6 +311,8 @@ function updateWeapon(entity: RobotEntity, dt: number) {
         entity.weaponRPM = Math.max(target, entity.weaponRPM - spec.weaponSpinupRate * 0.4 * dt);
       }
     }
+    // Track bar rotation for directional knockback calculations
+    entity.weaponBarAngle += Math.PI * 2 * (entity.weaponRPM / 60) * dt;
   }
 }
 
@@ -182,13 +320,11 @@ function updateWeapon(entity: RobotEntity, dt: number) {
 function applyPhysics(entity: RobotEntity, arenaW: number, arenaH: number, dt: number) {
   const maxVel = entity.spec.maxSpeed * THRUST_SCALE * 1.8;
 
-  // Integrate knockback impulse each frame
   entity.vx += entity.knockbackVx * dt * 60;
   entity.vy += entity.knockbackVy * dt * 60;
   entity.knockbackVx *= KNOCKBACK_DECAY;
   entity.knockbackVy *= KNOCKBACK_DECAY;
 
-  // Clamp velocity
   const vel = Math.sqrt(entity.vx ** 2 + entity.vy ** 2);
   if (vel > maxVel) { entity.vx = (entity.vx / vel) * maxVel; entity.vy = (entity.vy / vel) * maxVel; }
 
@@ -200,7 +336,6 @@ function applyPhysics(entity: RobotEntity, arenaW: number, arenaH: number, dt: n
   entity.vy *= FRICTION;
   entity.angularVel *= ANGULAR_FRICTION;
 
-  // Wall bounce — hard stop + bounce
   const r = robotRadius(entity) + WALL;
   if (entity.x < r) { entity.x = r; entity.vx = Math.abs(entity.vx) * 0.4; }
   if (entity.x > arenaW - r) { entity.x = arenaW - r; entity.vx = -Math.abs(entity.vx) * 0.4; }
@@ -214,10 +349,8 @@ type HitLoc = "front" | "left" | "right" | "rear";
 function hitLocation(attacker: RobotEntity, defender: RobotEntity): HitLoc {
   const dx = attacker.x - defender.x;
   const dy = attacker.y - defender.y;
-  // Defender's forward direction (local -y in world) = (sin(angle), -cos(angle))
   const fX = Math.sin(defender.angle);
   const fY = -Math.cos(defender.angle);
-  // Defender's right direction = local +x in world = (cos(angle), sin(angle))
   const rX = Math.cos(defender.angle);
   const rY = Math.sin(defender.angle);
   const fwd = dx * fX + dy * fY;
@@ -228,7 +361,7 @@ function hitLocation(attacker: RobotEntity, defender: RobotEntity): HitLoc {
   return fwd > 0 ? "front" : "rear";
 }
 
-// ── Collision & Damage ─────────────────────────────────────────────────────────
+// ── Spinner Hit ────────────────────────────────────────────────────────────────
 function applySpinnerHit(
   state: GameState,
   attacker: RobotEntity,
@@ -242,57 +375,106 @@ function applySpinnerHit(
 ) {
   if (now < defender.hitFlashUntil) return;
 
+  // ── Kinetic energy (already in game units) ────────────────────────────────
   const ke = attacker.spec.weaponKE * rpmPct;
   const armorRed = QUALITY_REDUCTION[defender.armor.quality];
   const loc = hitLocation(attacker, defender);
 
-  let armorDmg = ke * 0.38 * (1 - armorRed);
-  const compDmg = ke * 0.26 * (1 - armorRed);
+  // ── Impact angle scales damage: glancing = 30%, square = 100% ─────────────
+  const dmgScale = impactDamageScale(attacker, nx, ny);
+
+  // ── Armor damage ──────────────────────────────────────────────────────────
+  let armorDmg = ke * 0.40 * dmgScale * (1 - armorRed);
+  // ── Component (internal) damage ───────────────────────────────────────────
+  const compDmg = ke * 0.28 * dmgScale * (1 - armorRed);
+
+  const prevWeaponHP = defender.weapon.currentHP;
+  const prevDriveHP = defender.drive.currentHP;
+  const prevArmorHP = defender.armor.currentHP;
 
   if (loc === "front") {
-    defender.weapon.currentHP = Math.max(0, defender.weapon.currentHP - compDmg);
+    // Direct weapon-to-weapon: takes heavy weapon damage
+    defender.weapon.currentHP = Math.max(0, defender.weapon.currentHP - compDmg * 1.4);
+    armorDmg *= 0.8;
   } else if (loc === "left" || loc === "right") {
-    defender.drive.currentHP = Math.max(0, defender.drive.currentHP - compDmg);
+    // Side hit: shreds drive system on that side
+    defender.drive.currentHP = Math.max(0, defender.drive.currentHP - compDmg * 1.3);
+    armorDmg *= 0.9;
   } else {
-    armorDmg *= 1.35;
-    defender.drive.currentHP = Math.max(0, defender.drive.currentHP - compDmg * 0.5);
+    // Rear hit: chassis takes extra, internals exposed
+    armorDmg *= 1.45;
+    defender.weapon.currentHP = Math.max(0, defender.weapon.currentHP - compDmg * 0.35);
+    defender.drive.currentHP = Math.max(0, defender.drive.currentHP - compDmg * 0.35);
   }
 
-  let kbMult = 1.0;
-  if (attacker.spec.weaponType === "horizontal_spinner") { kbMult = 1.8; armorDmg *= 1.1; }
-  else if (attacker.spec.weaponType === "vertical_spinner") { kbMult = 0.85; armorDmg *= 1.25; }
-  else if (attacker.spec.weaponType === "drum") { kbMult = 0.75; }
+  // Weapon-type modifiers
+  if (attacker.spec.weaponType === "horizontal_spinner") armorDmg *= 1.15;
+  else if (attacker.spec.weaponType === "vertical_spinner") armorDmg *= 1.30;
+  // drum does less armor damage per hit but ignores some reduction (rapid multi-hit)
+  else if (attacker.spec.weaponType === "drum") armorDmg *= 0.75;
 
   defender.armor.currentHP = Math.max(0, defender.armor.currentHP - armorDmg);
   defender.totalDamageTaken += armorDmg + compDmg;
 
-  // Knockback — stored as per-frame impulse, scaled for dramatic effect
-  const kbSpd = (ke * 5.0 * kbMult) / defender.spec.mass;
-  defender.knockbackVx = nx * kbSpd;
-  defender.knockbackVy = ny * kbSpd;
-  // Angular knockback
-  defender.angularVel += (Math.random() - 0.5) * ke * 0.8 / defender.spec.mass;
+  // ── Physics-based directional knockback ───────────────────────────────────
+  const J = weaponImpulse(attacker, rpmPct);
+  const [kbNx, kbNy] = impactKnockbackDir(attacker, nx, ny);
+  const kbSpd = J / defender.spec.mass;
+
+  defender.knockbackVx = kbNx * kbSpd;
+  defender.knockbackVy = kbNy * kbSpd;
+  // Angular spin from off-center impact
+  defender.angularVel += (Math.random() - 0.5) * ke * 1.0 / defender.spec.mass;
+
+  // Attacker recoil (Newton's 3rd law — weapon slows, robot kicks back)
+  attacker.knockbackVx = -nx * kbSpd * 0.30;
+  attacker.knockbackVy = -ny * kbSpd * 0.30;
+  // RPM loss proportional to defender's armor quality
+  attacker.weaponRPM *= Math.max(0, 1 - (0.30 + (1 - armorRed) * 0.28));
+
   defender.hitFlashUntil = now + 180;
   defender.lastHitAngle = Math.atan2(ny, nx);
+  defender.lastHitSide = loc;
 
-  attacker.weaponRPM *= Math.max(0, 1 - (0.35 + (1 - armorRed) * 0.25));
+  // ── Part destruction checks ───────────────────────────────────────────────
+  // Weapon destroyed
+  if (prevWeaponHP > 0 && defender.weapon.currentHP <= 0) {
+    triggerWeaponDestruction(state, defender);
+  }
+  // Track destruction — individual side if drive critical from side hit
+  if (prevDriveHP > 0 && defender.drive.currentHP <= 0) {
+    triggerTrackDestruction(state, defender, "both");
+  } else if (defender.drive.currentHP / defender.drive.maxHP < 0.30) {
+    if (loc === "left" && !defender.destroyedParts.leftTrack) {
+      triggerTrackDestruction(state, defender, "left");
+    } else if (loc === "right" && !defender.destroyedParts.rightTrack) {
+      triggerTrackDestruction(state, defender, "right");
+    }
+  }
+  // Armor breach when first dropping below 20%
+  if (prevArmorHP / defender.armor.maxHP >= 0.20 &&
+    defender.armor.currentHP / defender.armor.maxHP < 0.20) {
+    triggerArmorBreach(state, defender);
+  }
 
-  // Attacker recoil
-  attacker.knockbackVx = -nx * kbSpd * 0.35;
-  attacker.knockbackVy = -ny * kbSpd * 0.35;
-
-  sparks(state, cx, cy, Math.atan2(ny, nx), 18 + Math.round(ke * 0.3), rpmPct);
-  if (armorDmg > 6) debris(state, cx, cy, defender.spec.primaryColor, Math.round(armorDmg * 0.2 + 3));
+  // ── Visual effects ────────────────────────────────────────────────────────
+  const sparkCount = 16 + Math.round(ke * 0.35 * dmgScale);
+  sparks(state, cx, cy, Math.atan2(kbNy, kbNx), sparkCount, rpmPct * dmgScale);
+  if (armorDmg > 5) {
+    debris(state, cx, cy, defender.spec.primaryColor, Math.round(armorDmg * 0.22 + 2));
+  }
   if (componentStatus(defender.armor) === "critical") smoke(state, defender.x, defender.y);
 
+  // ── KO ────────────────────────────────────────────────────────────────────
   if (defender.armor.currentHP <= 0) {
     defender.isAlive = false;
-    sparks(state, defender.x, defender.y, 0, 60, 1);
-    debris(state, defender.x, defender.y, defender.spec.primaryColor, 22);
-    smoke(state, defender.x, defender.y, 5);
+    sparks(state, defender.x, defender.y, 0, 70, 1);
+    debris(state, defender.x, defender.y, defender.spec.primaryColor, 24);
+    smoke(state, defender.x, defender.y, 6);
   }
 }
 
+// ── Hammer Hit ─────────────────────────────────────────────────────────────────
 function applyHammerHit(
   state: GameState,
   attacker: RobotEntity,
@@ -306,36 +488,58 @@ function applyHammerHit(
 
   const ke = attacker.spec.weaponKE;
   const armorRed = QUALITY_REDUCTION[defender.armor.quality];
-  const wepRed = QUALITY_REDUCTION[attacker.weapon.quality];
+  const wepQRed = QUALITY_REDUCTION[attacker.weapon.quality];
 
-  let dmg = ke * 0.6 * (1 - armorRed) * (1 + wepRed * 0.6);
+  // Hammer delivers concentrated impulse (no spin decomposition needed)
+  // Titanium hammer has AP penetration through armor gaps
+  let dmg = ke * 0.6 * (1 - armorRed) * (1 + wepQRed * 0.6);
+  const prevDriveHP = defender.drive.currentHP;
+  const prevWeaponHP = defender.weapon.currentHP;
+  const prevArmorHP = defender.armor.currentHP;
+
   if (attacker.weapon.quality === "titanium") {
-    dmg *= 1.25;
+    dmg *= 1.28;
+    // AP penetration — randomly damages internals directly
     const r = Math.random();
-    if (r < 0.35) defender.drive.currentHP = Math.max(0, defender.drive.currentHP - dmg * 0.35);
-    else if (r < 0.65) defender.weapon.currentHP = Math.max(0, defender.weapon.currentHP - dmg * 0.35);
+    if (r < 0.35) defender.drive.currentHP = Math.max(0, defender.drive.currentHP - dmg * 0.40);
+    else if (r < 0.65) defender.weapon.currentHP = Math.max(0, defender.weapon.currentHP - dmg * 0.40);
   }
 
   defender.armor.currentHP = Math.max(0, defender.armor.currentHP - dmg);
   defender.totalDamageTaken += dmg;
-  defender.hitFlashUntil = now + 150;
+  defender.hitFlashUntil = now + 160;
 
-  const angle = Math.atan2(defender.y - attacker.y, defender.x - attacker.x);
-  const kbSpd = (ke * 3.0) / defender.spec.mass;
-  defender.knockbackVx = Math.cos(angle) * kbSpd;
-  defender.knockbackVy = Math.sin(angle) * kbSpd;
+  const impactAngle = Math.atan2(defender.y - attacker.y, defender.x - attacker.x);
+  const kbSpd = (ke * 3.5) / defender.spec.mass;
+  defender.knockbackVx = Math.cos(impactAngle) * kbSpd;
+  defender.knockbackVy = Math.sin(impactAngle) * kbSpd;
+  defender.angularVel += (Math.random() - 0.5) * ke * 0.6 / defender.spec.mass;
+  defender.lastHitSide = "front";
 
-  sparks(state, cx, cy, angle, 14, 0.7);
-  debris(state, cx, cy, "#607d8b", 5);
+  // Part destruction
+  if (prevWeaponHP > 0 && defender.weapon.currentHP <= 0) {
+    triggerWeaponDestruction(state, defender);
+  }
+  if (prevDriveHP > 0 && defender.drive.currentHP <= 0) {
+    triggerTrackDestruction(state, defender, "both");
+  }
+  if (prevArmorHP / defender.armor.maxHP >= 0.20 &&
+    defender.armor.currentHP / defender.armor.maxHP < 0.20) {
+    triggerArmorBreach(state, defender);
+  }
+
+  sparks(state, cx, cy, impactAngle, 16, 0.75);
+  debris(state, cx, cy, "#607d8b", 6);
 
   if (defender.armor.currentHP <= 0) {
     defender.isAlive = false;
-    sparks(state, defender.x, defender.y, 0, 45, 1);
-    debris(state, defender.x, defender.y, defender.spec.primaryColor, 16);
-    smoke(state, defender.x, defender.y, 3);
+    sparks(state, defender.x, defender.y, 0, 50, 1);
+    debris(state, defender.x, defender.y, defender.spec.primaryColor, 18);
+    smoke(state, defender.x, defender.y, 4);
   }
 }
 
+// ── Lifter Hit ─────────────────────────────────────────────────────────────────
 function applyLifterHit(
   state: GameState,
   attacker: RobotEntity,
@@ -349,18 +553,20 @@ function applyLifterHit(
   if (now < defender.hitFlashUntil) return;
   if (attacker.weaponThrottle < 0.4) return;
 
-  const pushSpd = 280 / defender.spec.mass;
+  const pushSpd = 300 / defender.spec.mass;
   defender.knockbackVx = nx * pushSpd;
   defender.knockbackVy = ny * pushSpd;
   defender.hitFlashUntil = now + 80;
+  defender.lastHitSide = "front";
 
   const dmg = attacker.spec.weaponKE * 0.12;
   defender.armor.currentHP = Math.max(0, defender.armor.currentHP - dmg);
   defender.totalDamageTaken += dmg;
 
-  sparks(state, _cx, _cy, Math.atan2(ny, nx), 6, 0.3);
+  sparks(state, _cx, _cy, Math.atan2(ny, nx), 7, 0.35);
 }
 
+// ── Collision ─────────────────────────────────────────────────────────────────
 function checkCollision(state: GameState) {
   const { player: p, opponent: o } = state;
   const rp = robotRadius(p);
@@ -395,7 +601,7 @@ function checkCollision(state: GameState) {
   if (p.spec.weaponType === "lifter") applyLifterHit(state, p, o, nx, ny, now, cx, cy);
   if (o.spec.weaponType === "lifter") applyLifterHit(state, o, p, -nx, -ny, now, cx, cy);
 
-  // Physical impulse (always)
+  // Rigid body physical impulse (always, regardless of weapons)
   const rv = (p.vx - o.vx) * nx + (p.vy - o.vy) * ny;
   if (rv < 0) {
     const imp = rv * 0.55;
@@ -415,12 +621,12 @@ function wallAvoidAngle(e: RobotEntity, W: number, H: number): number | null {
   return ax !== 0 || ay !== 0 ? Math.atan2(ay, ax) : null;
 }
 
-function updateOpponentAI(
-  state: GameState,
-  entity: RobotEntity,
-  target: RobotEntity,
-  dt: number,
-) {
+function applyApproach(entity: RobotEntity, spd: number, d: number, closeRange: number, dt: number) {
+  if (d > closeRange) thrust(entity, spd * 0.85, dt);
+  else thrust(entity, spd * 0.3, dt);
+}
+
+function updateOpponentAI(state: GameState, entity: RobotEntity, target: RobotEntity, dt: number) {
   const ai = getAi(entity);
   ai.phaseTimer += dt;
 
@@ -492,7 +698,10 @@ function updateOpponentAI(
       ai.retreatTimer -= dt;
       steerTo(entity, toTarget + Math.PI * 0.9, trn, dt);
       thrust(entity, -spd * 0.75, dt);
-      if (ai.retreatTimer <= 0) { ai.phase = "circle"; ai.phaseTimer = 0; ai.circleDir = (ai.circleDir * -1) as 1 | -1; }
+      if (ai.retreatTimer <= 0) {
+        ai.phase = "circle"; ai.phaseTimer = 0;
+        ai.circleDir = (ai.circleDir * -1) as 1 | -1;
+      }
     } else if (ai.phase === "circle") {
       const circ = toTarget + (Math.PI / 2) * ai.circleDir;
       steerTo(entity, circ, trn, dt);
@@ -515,11 +724,6 @@ function updateOpponentAI(
   if (wa !== null) steerTo(entity, wa, trn * 0.7, dt);
 }
 
-function applyApproach(entity: RobotEntity, spd: number, d: number, closeRange: number, dt: number) {
-  if (d > closeRange) thrust(entity, spd * 0.85, dt);
-  else thrust(entity, spd * 0.3, dt);
-}
-
 // ── Player Input ───────────────────────────────────────────────────────────────
 function updatePlayerInput(state: GameState, entity: RobotEntity, dt: number) {
   const { keys } = state;
@@ -533,7 +737,6 @@ function updatePlayerInput(state: GameState, entity: RobotEntity, dt: number) {
     : (keys.has("a") || keys.has("arrowleft")) ? -1 : 0;
 
   if (fwd) thrust(entity, spd * fwd, dt);
-  // A turns counter-clockwise (left), D turns clockwise (right)
   if (rot) entity.angularVel += trn * rot * dt * ANGULAR_SCALE;
 
   const weaponInput = keys.has("shift") || state.mouseDown;
@@ -554,7 +757,7 @@ function updatePlayerInput(state: GameState, entity: RobotEntity, dt: number) {
   }
 }
 
-// ── Win / Match ────────────────────────────────────────────────────────────────
+// ── Win Conditions ─────────────────────────────────────────────────────────────
 function robotScore(e: RobotEntity): number {
   return (
     (e.armor.currentHP / e.armor.maxHP) * 60 +
@@ -590,9 +793,20 @@ function checkWinConditions(state: GameState) {
 function updateDamageSmokeEffects(state: GameState, dt: number) {
   for (const e of [state.player, state.opponent]) {
     if (!e.isAlive) continue;
-    const status = componentStatus(e.armor);
-    if (status === "critical" && Math.random() < dt * 6) smoke(state, e.x, e.y);
-    if (status === "disabled" && Math.random() < dt * 15) smoke(state, e.x, e.y, 2);
+    const armorStatus = componentStatus(e.armor);
+    if (armorStatus === "critical" && Math.random() < dt * 7) smoke(state, e.x, e.y);
+    if (armorStatus === "disabled" && Math.random() < dt * 18) smoke(state, e.x, e.y, 2);
+    // Destroyed tracks emit occasional sparks
+    if (e.destroyedParts.leftTrack && Math.random() < dt * 3) {
+      const wx = e.x - Math.cos(e.angle) * e.spec.bodyWidth * 0.55;
+      const wy = e.y - Math.sin(e.angle) * e.spec.bodyWidth * 0.55;
+      sparks(state, wx, wy, Math.random() * Math.PI * 2, 3, 0.4);
+    }
+    if (e.destroyedParts.rightTrack && Math.random() < dt * 3) {
+      const wx = e.x + Math.cos(e.angle) * e.spec.bodyWidth * 0.55;
+      const wy = e.y + Math.sin(e.angle) * e.spec.bodyWidth * 0.55;
+      sparks(state, wx, wy, Math.random() * Math.PI * 2, 3, 0.4);
+    }
   }
 }
 
@@ -613,6 +827,7 @@ export function buildInitialState(
     weapon: makeComp(spec.weaponQuality),
     weaponRPM: 0,
     weaponThrottle: 0,
+    weaponBarAngle: 0,
     hammerState: "ready",
     hammerAngle: -Math.PI * 0.6,
     hammerTimer: 0,
@@ -620,18 +835,22 @@ export function buildInitialState(
     knockbackVx: 0, knockbackVy: 0,
     hitFlashUntil: 0,
     lastHitAngle: 0,
+    lastHitSide: "front",
     isAlive: true,
     totalDamageTaken: 0,
+    destroyedParts: {
+      weapon: false,
+      leftTrack: false,
+      rightTrack: false,
+      armorBreached: false,
+    },
   });
 
-  // Player on left, facing right (angle=PI/2 → forward=(sin(PI/2),-cos(PI/2))=(1,0))
-  // Opponent on right, facing left (angle=-PI/2 → forward=(sin(-PI/2),-cos(-PI/2))=(-1,0))
   return {
     player: makeEntity(playerSpec, arenaW * 0.22, arenaH * 0.5, Math.PI / 2),
     opponent: makeEntity(opponentSpec, arenaW * 0.78, arenaH * 0.5, -Math.PI / 2),
     particles: [],
-    arenaW,
-    arenaH,
+    arenaW, arenaH,
     match: {
       phase: "countdown",
       timeRemaining: MATCH_DURATION,
@@ -640,8 +859,7 @@ export function buildInitialState(
       winReason: "",
     },
     keys: new Set(),
-    mouseX: 0, mouseY: 0,
-    mouseDown: false,
+    mouseX: 0, mouseY: 0, mouseDown: false,
     cameraX: 0, cameraY: 0,
     time: 0,
   };
@@ -674,16 +892,14 @@ export function updateGame(state: GameState, dt: number): GameState {
   applyPhysics(state.opponent, state.arenaW, state.arenaH, clampedDt);
 
   checkCollision(state);
-
   updateDamageSmokeEffects(state, clampedDt);
 
-  // Particle update
   for (let i = state.particles.length - 1; i >= 0; i--) {
     const p = state.particles[i];
     p.x += p.vx * clampedDt;
     p.y += p.vy * clampedDt;
-    p.vx *= p.type === "smoke" ? 0.97 : 0.94;
-    p.vy *= p.type === "smoke" ? 0.97 : 0.94;
+    p.vx *= p.type === "smoke" ? 0.97 : 0.93;
+    p.vy *= p.type === "smoke" ? 0.97 : 0.93;
     p.life -= clampedDt;
     if (p.life <= 0) state.particles.splice(i, 1);
   }

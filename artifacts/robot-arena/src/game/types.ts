@@ -34,7 +34,7 @@ export const QUALITY_HP: Record<ComponentQuality, number> = {
 
 export const QUALITY_REDUCTION: Record<ComponentQuality, number> = {
   budget: 0,
-  standard: 0.1,
+  standard: 0.10,
   premium: 0.22,
   titanium: 0.35,
 };
@@ -45,6 +45,18 @@ export const QUALITY_LABEL: Record<ComponentQuality, string> = {
   premium: "PREMIUM",
   titanium: "TITANIUM",
 };
+
+// ── Destroyed Parts ────────────────────────────────────────────────────────────
+// Tracks *visually* which parts have been physically wrecked.
+// weapon: spinner/hammer physically gone or dangling
+// leftTrack / rightTrack: individual track pods torn off
+// armorBreached: hull holed, internals exposed
+export interface DestroyedParts {
+  weapon: boolean;
+  leftTrack: boolean;
+  rightTrack: boolean;
+  armorBreached: boolean;
+}
 
 export interface RobotSpec {
   id: string;
@@ -83,6 +95,8 @@ export interface RobotEntity {
   weapon: ComponentSpec;
   weaponRPM: number;
   weaponThrottle: number;
+  // Weapon bar rotation angle accumulated in local space (for directional knockback)
+  weaponBarAngle: number;
   hammerState: HammerState;
   hammerAngle: number;
   hammerTimer: number;
@@ -91,8 +105,11 @@ export interface RobotEntity {
   knockbackVy: number;
   hitFlashUntil: number;
   lastHitAngle: number;
+  // Which side last took a major hit (used for asymmetric track damage rendering)
+  lastHitSide: "left" | "right" | "front" | "rear";
   isAlive: boolean;
   totalDamageTaken: number;
+  destroyedParts: DestroyedParts;
 }
 
 export interface Particle {
