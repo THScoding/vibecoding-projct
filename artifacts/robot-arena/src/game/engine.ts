@@ -324,8 +324,10 @@ function updateWeapon(entity: RobotEntity, dt: number) {
 }
 
 // Wall slam: robots flung into walls at high speed take bonus damage
-const WALL_SLAM_THRESHOLD = 260; // px/s entry speed that causes damage
-const WALL_SLAM_DMG = 0.022;     // damage per px/s above threshold
+// Threshold is set well above normal driving speed so only genuine weapon launches trigger it.
+// Normal driving max ≈ maxSpeed × THRUST_SCALE × 1.8 ≈ 350 px/s for fastest bots.
+const WALL_SLAM_THRESHOLD = 420; // px/s — must be clearly above normal driving velocity
+const WALL_SLAM_DMG = 0.026;     // damage per px/s above threshold
 
 // ── Physics ────────────────────────────────────────────────────────────────────
 function applyPhysics(state: GameState, entity: RobotEntity, arenaW: number, arenaH: number, dt: number) {
@@ -704,13 +706,16 @@ function checkCollision(state: GameState) {
 
 // ── AI Driving ────────────────────────────────────────────────────────────────
 function wallAvoidAngle(e: RobotEntity, W: number, H: number): number | null {
-  const m = 120;
+  // Only trigger very close to walls — 75px margin keeps it from fighting combat steering
+  const m = 75;
   let ax = 0, ay = 0;
-  if (e.x < m) ax += 1;
-  if (e.x > W - m) ax -= 1;
-  if (e.y < m) ay += 1;
-  if (e.y > H - m) ay -= 1;
-  return ax !== 0 || ay !== 0 ? Math.atan2(ay, ax) : null;
+  // Weight proportional to how close the wall is
+  if (e.x < m)     ax += (m - e.x) / m;
+  if (e.x > W - m) ax -= (e.x - (W - m)) / m;
+  if (e.y < m)     ay += (m - e.y) / m;
+  if (e.y > H - m) ay -= (e.y - (H - m)) / m;
+  const mag = Math.sqrt(ax * ax + ay * ay);
+  return mag > 0.1 ? Math.atan2(ay, ax) : null;
 }
 
 function applyApproach(entity: RobotEntity, spd: number, d: number, closeRange: number, dt: number) {
@@ -735,35 +740,73 @@ function updateOpponentAI(state: GameState, entity: RobotEntity, target: RobotEn
 
   if (isSpinner) entity.weaponThrottle = 1;
 
-  if (spec.drivingStyle === "aggressive" && isSpinner) {
+  // ── Drum spinners: charge constantly, very brief recovery ─────────────────
+  // Real drums (Minotaur) never need a long spinup phase — they reach RPM in
+  // under a second and just keep driving into opponents relentlessly.
+  if (spec.weaponType === "drum" && isSpinner) {
     if (ai.phase === "retreat") {
       ai.retreatTimer -= dt;
       steerTo(entity, toTarget + Math.PI, trn, dt);
-      thrust(entity, -spd * 0.65, dt);
+      thrust(entity, -spd * 0.55, dt);
+      if (ai.retreatTimer <= 0) { ai.phase = "charge"; ai.phaseTimer = 0; }
+    } else {
+      // Always face and drive at target
+      steerTo(entity, toTarget, trn, dt);
+      thrust(entity, spd, dt);
+      // Only pull back briefly if RPM is very depleted after a big hit
+      if (rpmPct < 0.25 && d > 110) {
+        ai.phase = "retreat";
+        ai.retreatTimer = 0.45;
+      }
+    }
+
+  // ── Horizontal spinners: spin up at distance, charge when ready ───────────
+  // Need full RPM to be dangerous, so they orbit/retreat to spin up before
+  // charging. After a big hit they back off to re-spin.
+  } else if (spec.weaponType === "horizontal_spinner" && isSpinner) {
+    if (ai.phase === "retreat") {
+      ai.retreatTimer -= dt;
+      // Retreat while facing AWAY from the wall (use target direction, not away)
+      steerTo(entity, toTarget, trn, dt);
+      thrust(entity, -spd * 0.6, dt);
       if (ai.retreatTimer <= 0) { ai.phase = "spinup"; ai.phaseTimer = 0; }
     } else if (ai.phase === "spinup") {
-      if (d < 260) { steerTo(entity, toTarget + Math.PI, trn, dt); thrust(entity, -spd * 0.5, dt); }
-      else steerTo(entity, toTarget + 0.4, trn, dt);
+      // Orbit at mid-range while spinning up; don't back into walls
+      if (d < 280) {
+        const orbitAngle = toTarget + Math.PI * 0.5 * ai.circleDir;
+        steerTo(entity, orbitAngle, trn, dt);
+        thrust(entity, spd * 0.5, dt);
+      } else {
+        steerTo(entity, toTarget + 0.3 * ai.circleDir, trn, dt);
+      }
       if (rpmPct >= 0.72) { ai.phase = "charge"; ai.phaseTimer = 0; }
     } else if (ai.phase === "charge") {
       steerTo(entity, toTarget, trn, dt);
       thrust(entity, spd, dt);
-      if (rpmPct < 0.25 && d > 120) { ai.phase = "retreat"; ai.retreatTimer = 1.2; }
+      if (rpmPct < 0.22 && d > 110) { ai.phase = "retreat"; ai.retreatTimer = 1.1; }
     } else { ai.phase = "spinup"; }
-  } else if (spec.drivingStyle === "aggressive" && spec.weaponType === "vertical_spinner") {
+
+  // ── Vertical spinners: moderate retreat, aggressive charge ────────────────
+  // Vertical discs recover RPM faster than horizontal bars and deliver big
+  // upward launches, so they can be more persistent about engaging.
+  } else if (spec.weaponType === "vertical_spinner" && isSpinner) {
     if (ai.phase === "retreat") {
       ai.retreatTimer -= dt;
-      steerTo(entity, toTarget + Math.PI, trn, dt);
-      thrust(entity, -spd * 0.6, dt);
+      steerTo(entity, toTarget, trn, dt);
+      thrust(entity, -spd * 0.55, dt);
       if (ai.retreatTimer <= 0) { ai.phase = "spinup"; ai.phaseTimer = 0; }
     } else if (ai.phase === "spinup") {
-      if (d < 240) thrust(entity, -spd * 0.3, dt);
-      if (rpmPct >= 0.6) { ai.phase = "charge"; ai.phaseTimer = 0; }
+      // Circle to regain RPM — keep moving so we're a harder target
+      const circAngle = toTarget + Math.PI * 0.45 * ai.circleDir;
+      steerTo(entity, circAngle, trn, dt);
+      thrust(entity, spd * 0.65, dt);
+      if (rpmPct >= 0.55) { ai.phase = "charge"; ai.phaseTimer = 0; }
     } else {
       steerTo(entity, toTarget, trn, dt);
-      thrust(entity, spd * 0.9, dt);
-      if (rpmPct < 0.2) { ai.phase = "retreat"; ai.retreatTimer = 1.5; }
+      thrust(entity, spd * 0.95, dt);
+      if (rpmPct < 0.18) { ai.phase = "retreat"; ai.retreatTimer = 0.8; }
     }
+
   } else if (spec.drivingStyle === "control" && spec.weaponType === "hammer") {
     // ── Hammer AI: dash in → strike → escape → reset ─────────────────────────
     // Real hammer drivers charge fast, fire at close range, and immediately
@@ -876,8 +919,11 @@ function updateOpponentAI(state: GameState, entity: RobotEntity, target: RobotEn
     applyApproach(entity, spd, d, 120, dt);
   }
 
+  // Wall avoidance: only steer away when very close AND not in an attack phase
+  // (charge/fire bots know what they're doing — don't fight their steering)
+  const inAttack = ai.phase === "charge" || ai.phase === "fire";
   const wa = wallAvoidAngle(entity, state.arenaW, state.arenaH);
-  if (wa !== null) steerTo(entity, wa, trn * 0.7, dt);
+  if (wa !== null && !inAttack) steerTo(entity, wa, trn * 0.85, dt);
 }
 
 // ── Player Input ───────────────────────────────────────────────────────────────
