@@ -112,6 +112,9 @@ function impactKnockbackDir(
   return [kbX / mag, kbY / mag];
 }
 
+// Global knockback scale — tune here to feel right
+const KNOCKBACK_SCALE = 0.72;
+
 // Glancing vs direct hit: scales damage 0.3–1.0 based on how square the hit is
 function impactDamageScale(attacker: RobotEntity, nx: number, ny: number): number {
   const worldBarAngle = attacker.weaponBarAngle + attacker.angle;
@@ -300,15 +303,19 @@ function updateWeapon(entity: RobotEntity, dt: number) {
 
   if (spec.maxWeaponRPM > 0) {
     const disabled = componentStatus(entity.weapon) === "disabled";
+    // Heavier weapons (higher KE) spin up slightly slower — proportional penalty.
+    // KE=55 → ~92% rate, KE=105 → ~80% rate. Keeps it subtle.
+    const keSpinScale = Math.max(0.75, 1 - spec.weaponKE * 0.0019);
+    const effectiveSpinupRate = spec.weaponSpinupRate * keSpinScale;
     if (disabled) {
-      entity.weaponRPM = Math.max(0, entity.weaponRPM - spec.weaponSpinupRate * 2.5 * dt);
+      entity.weaponRPM = Math.max(0, entity.weaponRPM - effectiveSpinupRate * 2.5 * dt);
     } else {
       const cap = spec.maxWeaponRPM * (entity.weapon.currentHP / entity.weapon.maxHP);
       const target = entity.weaponThrottle * cap;
       if (entity.weaponRPM < target) {
-        entity.weaponRPM = Math.min(target, entity.weaponRPM + spec.weaponSpinupRate * dt);
+        entity.weaponRPM = Math.min(target, entity.weaponRPM + effectiveSpinupRate * dt);
       } else {
-        entity.weaponRPM = Math.max(target, entity.weaponRPM - spec.weaponSpinupRate * 0.4 * dt);
+        entity.weaponRPM = Math.max(target, entity.weaponRPM - effectiveSpinupRate * 0.4 * dt);
       }
     }
     // Track bar rotation for directional knockback calculations
@@ -419,7 +426,7 @@ function applySpinnerHit(
   // ── Physics-based directional knockback ───────────────────────────────────
   const J = weaponImpulse(attacker, rpmPct);
   const [kbNx, kbNy] = impactKnockbackDir(attacker, nx, ny);
-  const kbSpd = J / defender.spec.mass;
+  const kbSpd = (J / defender.spec.mass) * KNOCKBACK_SCALE;
 
   defender.knockbackVx = kbNx * kbSpd;
   defender.knockbackVy = kbNy * kbSpd;
