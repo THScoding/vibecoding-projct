@@ -127,7 +127,7 @@ function impactDamageScale(attacker: RobotEntity, nx: number, ny: number): numbe
 }
 
 // ── AI State ──────────────────────────────────────────────────────────────────
-type AiPhase = "spinup" | "charge" | "retreat" | "circle" | "approach" | "fire";
+type AiPhase = "spinup" | "charge" | "retreat" | "circle" | "approach" | "fire" | "reposition";
 
 interface AiState {
   phase: AiPhase;
@@ -323,8 +323,12 @@ function updateWeapon(entity: RobotEntity, dt: number) {
   }
 }
 
+// Wall slam: robots flung into walls at high speed take bonus damage
+const WALL_SLAM_THRESHOLD = 260; // px/s entry speed that causes damage
+const WALL_SLAM_DMG = 0.022;     // damage per px/s above threshold
+
 // ── Physics ────────────────────────────────────────────────────────────────────
-function applyPhysics(entity: RobotEntity, arenaW: number, arenaH: number, dt: number) {
+function applyPhysics(state: GameState, entity: RobotEntity, arenaW: number, arenaH: number, dt: number) {
   const maxVel = entity.spec.maxSpeed * THRUST_SCALE * 1.8;
 
   entity.vx += entity.knockbackVx * dt * 60;
@@ -344,10 +348,23 @@ function applyPhysics(entity: RobotEntity, arenaW: number, arenaH: number, dt: n
   entity.angularVel *= ANGULAR_FRICTION;
 
   const r = robotRadius(entity) + WALL;
-  if (entity.x < r) { entity.x = r; entity.vx = Math.abs(entity.vx) * 0.4; }
-  if (entity.x > arenaW - r) { entity.x = arenaW - r; entity.vx = -Math.abs(entity.vx) * 0.4; }
-  if (entity.y < r) { entity.y = r; entity.vy = Math.abs(entity.vy) * 0.4; }
-  if (entity.y > arenaH - r) { entity.y = arenaH - r; entity.vy = -Math.abs(entity.vy) * 0.4; }
+
+  // Wall collision — check for high-speed slams before bouncing
+  function wallSlam(impactVel: number, wallAngle: number) {
+    if (impactVel > WALL_SLAM_THRESHOLD) {
+      const excess = impactVel - WALL_SLAM_THRESHOLD;
+      const slamDmg = excess * WALL_SLAM_DMG;
+      entity.armor.currentHP = Math.max(0, entity.armor.currentHP - slamDmg);
+      entity.totalDamageTaken += slamDmg;
+      sparks(state, entity.x, entity.y, wallAngle, 14 + Math.round(excess * 0.05), 0.9);
+      if (excess > 180) debris(state, entity.x, entity.y, entity.spec.primaryColor, 5);
+    }
+  }
+
+  if (entity.x < r)          { wallSlam(-entity.vx, Math.PI);      entity.x = r;          entity.vx =  Math.abs(entity.vx) * 0.35; }
+  if (entity.x > arenaW - r) { wallSlam( entity.vx, 0);            entity.x = arenaW - r; entity.vx = -Math.abs(entity.vx) * 0.35; }
+  if (entity.y < r)          { wallSlam(-entity.vy, Math.PI * 1.5); entity.y = r;          entity.vy =  Math.abs(entity.vy) * 0.35; }
+  if (entity.y > arenaH - r) { wallSlam( entity.vy, Math.PI * 0.5); entity.y = arenaH - r; entity.vy = -Math.abs(entity.vy) * 0.35; }
 }
 
 // ── Hit Location ───────────────────────────────────────────────────────────────
@@ -491,62 +508,78 @@ function applyHammerHit(
   cy: number,
 ) {
   if (now < defender.hitFlashUntil) return;
-  if (attacker.hammerAngle < Math.PI * 0.2) return;
+  // Fire from the moment the arm starts swinging (lower threshold = easier to land)
+  if (attacker.hammerAngle < Math.PI * 0.12) return;
 
   const ke = attacker.spec.weaponKE;
   const armorRed = QUALITY_REDUCTION[defender.armor.quality];
   const wepQRed = QUALITY_REDUCTION[attacker.weapon.quality];
 
-  // Hammer delivers concentrated impulse (no spin decomposition needed)
-  // Titanium hammer has AP penetration through armor gaps
-  let dmg = ke * 0.6 * (1 - armorRed) * (1 + wepQRed * 0.6);
+  // Hammer damage: pneumatic strike — high single-hit damage scaled by weapon quality
+  // Base: ke × 0.85, reduced by armor, boosted by weapon quality
+  let dmg = ke * 0.85 * (1 - armorRed * 0.7) * (1 + wepQRed * 0.8);
   const prevDriveHP = defender.drive.currentHP;
   const prevWeaponHP = defender.weapon.currentHP;
   const prevArmorHP = defender.armor.currentHP;
 
   if (attacker.weapon.quality === "titanium") {
-    dmg *= 1.28;
-    // AP penetration — randomly damages internals directly
+    dmg *= 1.35;
+    // Titanium AP: ignores a portion of armor reduction and hits internals directly
     const r = Math.random();
-    if (r < 0.35) defender.drive.currentHP = Math.max(0, defender.drive.currentHP - dmg * 0.40);
-    else if (r < 0.65) defender.weapon.currentHP = Math.max(0, defender.weapon.currentHP - dmg * 0.40);
+    if (r < 0.40) defender.drive.currentHP = Math.max(0, defender.drive.currentHP - dmg * 0.50);
+    else if (r < 0.72) defender.weapon.currentHP = Math.max(0, defender.weapon.currentHP - dmg * 0.50);
+  } else if (attacker.weapon.quality === "premium") {
+    // Premium: occasional internal hit
+    if (Math.random() < 0.25) {
+      defender.drive.currentHP = Math.max(0, defender.drive.currentHP - dmg * 0.30);
+    }
   }
 
   defender.armor.currentHP = Math.max(0, defender.armor.currentHP - dmg);
   defender.totalDamageTaken += dmg;
-  defender.hitFlashUntil = now + 160;
+  defender.hitFlashUntil = now + 200;
 
-  const impactAngle = Math.atan2(defender.y - attacker.y, defender.x - attacker.x);
-  const kbSpd = (ke * 3.5) / defender.spec.mass;
-  defender.knockbackVx = Math.cos(impactAngle) * kbSpd;
-  defender.knockbackVy = Math.sin(impactAngle) * kbSpd;
-  defender.angularVel += (Math.random() - 0.5) * ke * 0.6 / defender.spec.mass;
-  defender.lastHitSide = "front";
+  // Knockback: hammer drives down, so push is mostly in attacker's forward direction
+  const hammerFwdX = Math.sin(attacker.angle);
+  const hammerFwdY = -Math.cos(attacker.angle);
+  const kbSpd = (ke * 4.5) / defender.spec.mass;
+  defender.knockbackVx = hammerFwdX * kbSpd * 0.7 + (Math.random() - 0.5) * kbSpd * 0.3;
+  defender.knockbackVy = hammerFwdY * kbSpd * 0.7 + (Math.random() - 0.5) * kbSpd * 0.3;
+  defender.angularVel += (Math.random() - 0.5) * ke * 0.9 / defender.spec.mass;
+  defender.lastHitSide = hitLocation(attacker, defender);
 
   // Part destruction
-  if (prevWeaponHP > 0 && defender.weapon.currentHP <= 0) {
-    triggerWeaponDestruction(state, defender);
-  }
-  if (prevDriveHP > 0 && defender.drive.currentHP <= 0) {
-    triggerTrackDestruction(state, defender, "both");
-  }
+  if (prevWeaponHP > 0 && defender.weapon.currentHP <= 0) triggerWeaponDestruction(state, defender);
+  if (prevDriveHP > 0 && defender.drive.currentHP <= 0) triggerTrackDestruction(state, defender, "both");
   if (prevArmorHP / defender.armor.maxHP >= 0.20 &&
     defender.armor.currentHP / defender.armor.maxHP < 0.20) {
     triggerArmorBreach(state, defender);
   }
 
-  sparks(state, cx, cy, impactAngle, 16, 0.75);
-  debris(state, cx, cy, "#607d8b", 6);
+  const impactAngle = Math.atan2(hammerFwdY, hammerFwdX);
+  sparks(state, cx, cy, impactAngle, 22, 0.85);
+  debris(state, cx, cy, "#607d8b", 8);
+  if (dmg > 20) smoke(state, cx, cy);
 
   if (defender.armor.currentHP <= 0) {
     defender.isAlive = false;
-    sparks(state, defender.x, defender.y, 0, 50, 1);
-    debris(state, defender.x, defender.y, defender.spec.primaryColor, 18);
-    smoke(state, defender.x, defender.y, 4);
+    sparks(state, defender.x, defender.y, 0, 55, 1);
+    debris(state, defender.x, defender.y, defender.spec.primaryColor, 20);
+    smoke(state, defender.x, defender.y, 5);
   }
 }
 
-// ── Lifter Hit ─────────────────────────────────────────────────────────────────
+// ── Flipper / Lifter Hit ───────────────────────────────────────────────────────
+// A real flipper works like this:
+//  1. Bot drives its wedge/fork UNDER the opponent (approaching from front or side)
+//  2. Hydraulic arm fires — opponent is hurled into the air (massive velocity impulse)
+//  3. Opponent slams into the wall or arena floor for bonus damage
+//  4. Hydraulics must repressurize before next flip (~2s cooldown)
+//
+// In 2D we simulate this as:
+//  - Active flip (throttle held): launch defender in attacker's forward direction
+//    at ~1000 px/s — they slide across the arena and slam the wall
+//  - Passive contact (no throttle): gentle wedge push, no damage
 function applyLifterHit(
   state: GameState,
   attacker: RobotEntity,
@@ -554,23 +587,75 @@ function applyLifterHit(
   nx: number,
   ny: number,
   now: number,
-  _cx: number,
-  _cy: number,
+  cx: number,
+  cy: number,
 ) {
-  if (now < defender.hitFlashUntil) return;
-  if (attacker.weaponThrottle < 0.4) return;
+  const flipReady = attacker.hammerCooldown <= 0;
+  const active = attacker.weaponThrottle > 0.45 && flipReady;
 
-  const pushSpd = 300 / defender.spec.mass;
-  defender.knockbackVx = nx * pushSpd;
-  defender.knockbackVy = ny * pushSpd;
-  defender.hitFlashUntil = now + 80;
-  defender.lastHitSide = "front";
+  if (active) {
+    // ── Full hydraulic launch ─────────────────────────────────────────────────
+    // Direction: attacker's facing forward + collision normal blend (wedge geometry)
+    const fwdX = Math.sin(attacker.angle);
+    const fwdY = -Math.cos(attacker.angle);
+    // Blend facing with normal so glancing approaches still launch outward
+    const blendX = fwdX * 0.65 + nx * 0.35;
+    const blendY = fwdY * 0.65 + ny * 0.35;
+    const blendMag = Math.sqrt(blendX * blendX + blendY * blendY);
+    const launchX = blendMag > 0.01 ? blendX / blendMag : nx;
+    const launchY = blendMag > 0.01 ? blendY / blendMag : ny;
 
-  const dmg = attacker.spec.weaponKE * 0.12;
-  defender.armor.currentHP = Math.max(0, defender.armor.currentHP - dmg);
-  defender.totalDamageTaken += dmg;
+    // Launch velocity: scales with weaponKE, divided by mass
+    const launchSpd = (attacker.spec.weaponKE * 18) / defender.spec.mass;
+    defender.knockbackVx = launchX * launchSpd;
+    defender.knockbackVy = launchY * launchSpd;
+    // Tumble through the air
+    defender.angularVel += (Math.random() - 0.5) * 5.5;
+    defender.hitFlashUntil = now + 250;
+    defender.lastHitSide = hitLocation(attacker, defender);
 
-  sparks(state, _cx, _cy, Math.atan2(ny, nx), 7, 0.35);
+    // Damage on the launch itself (wedge getting under and lifting is traumatic)
+    const ke = attacker.spec.weaponKE;
+    const armorRed = QUALITY_REDUCTION[defender.armor.quality];
+    const dmg = ke * 0.42 * (1 - armorRed * 0.5);
+    const prevArmorHP = defender.armor.currentHP;
+    defender.armor.currentHP = Math.max(0, defender.armor.currentHP - dmg);
+    defender.totalDamageTaken += dmg;
+
+    if (prevArmorHP / defender.armor.maxHP >= 0.20 &&
+      defender.armor.currentHP / defender.armor.maxHP < 0.20) {
+      triggerArmorBreach(state, defender);
+    }
+
+    // Attacker recoil (hydraulics push back on the chassis)
+    attacker.knockbackVx = -launchX * launchSpd * 0.18;
+    attacker.knockbackVy = -launchY * launchSpd * 0.18;
+
+    // Hydraulic repressurize cooldown (~2s)
+    attacker.hammerCooldown = 2.0;
+
+    // Big launch effects
+    sparks(state, cx, cy, Math.atan2(launchY, launchX), 24, 1.0);
+    debris(state, cx, cy, defender.spec.primaryColor, 10);
+
+    if (defender.armor.currentHP <= 0) {
+      defender.isAlive = false;
+      sparks(state, defender.x, defender.y, 0, 60, 1);
+      debris(state, defender.x, defender.y, defender.spec.primaryColor, 22);
+      smoke(state, defender.x, defender.y, 5);
+    }
+
+  } else if (!active) {
+    // ── Passive wedge contact — gentle shove, no damage ──────────────────────
+    if (now < defender.hitFlashUntil) return;
+    const pushSpd = 80 / defender.spec.mass;
+    defender.knockbackVx = nx * pushSpd;
+    defender.knockbackVy = ny * pushSpd;
+    defender.hitFlashUntil = now + 60;
+    sparks(state, cx, cy, Math.atan2(ny, nx), 4, 0.18);
+  }
+
+  void ny; // used above via nx/ny blend
 }
 
 // ── Collision ─────────────────────────────────────────────────────────────────
@@ -680,25 +765,89 @@ function updateOpponentAI(state: GameState, entity: RobotEntity, target: RobotEn
       if (rpmPct < 0.2) { ai.phase = "retreat"; ai.retreatTimer = 1.5; }
     }
   } else if (spec.drivingStyle === "control" && spec.weaponType === "hammer") {
+    // ── Hammer AI: dash in → strike → escape → reset ─────────────────────────
+    // Real hammer drivers charge fast, fire at close range, and immediately
+    // back away so they can line up another run.
     entity.weaponThrottle = 1;
-    if (ai.phase === "fire") {
+
+    if (ai.phase === "retreat") {
+      // Back away after a strike to reset for the next charge
+      ai.retreatTimer -= dt;
+      steerTo(entity, toTarget + Math.PI, trn, dt);
+      thrust(entity, -spd * 0.9, dt);
+      if (ai.retreatTimer <= 0) { ai.phase = "approach"; ai.phaseTimer = 0; }
+
+    } else if (ai.phase === "fire") {
+      // Keep driving into opponent while hammer swings
+      steerTo(entity, toTarget, trn * 1.3, dt);
+      thrust(entity, spd * 0.4, dt);
       ai.phaseTimer += dt;
-      if (ai.phaseTimer > 0.6) { ai.phase = "approach"; ai.phaseTimer = 0; }
+      // After arm completes retract, escape
+      if (entity.hammerState === "ready" && ai.phaseTimer > 0.3) {
+        ai.phase = "retreat";
+        ai.retreatTimer = 0.7 + Math.random() * 0.4;
+        ai.phaseTimer = 0;
+      }
+
     } else {
+      // Approach: aim and close distance
       steerTo(entity, toTarget, trn, dt);
-      applyApproach(entity, spd, d, 100, dt);
-      if (d < 90 && entity.hammerCooldown <= 0 && componentStatus(entity.weapon) !== "disabled") {
+      // Close range: dash in at full speed
+      const dashRange = 180;
+      if (d > dashRange) {
+        thrust(entity, spd * 0.82, dt);
+      } else {
+        // Dash at full speed to close gap
+        thrust(entity, spd, dt);
+      }
+      // Fire when close enough and hammer ready
+      if (d < 110 && entity.hammerCooldown <= 0 && componentStatus(entity.weapon) !== "disabled") {
         entity.hammerState = "striking";
-        entity.hammerTimer = 0.18;
+        entity.hammerTimer = 0.16;
         entity.hammerAngle = -Math.PI * 0.6;
-        entity.hammerCooldown = spec.id === "beta" ? 2.2 : 1.6;
+        entity.hammerCooldown = spec.id === "beta" ? 1.8 : 1.2;
         ai.phase = "fire"; ai.phaseTimer = 0;
       }
     }
+
   } else if (spec.drivingStyle === "control" && spec.weaponType === "lifter") {
-    steerTo(entity, toTarget, trn, dt);
-    applyApproach(entity, spd, d, 80, dt);
-    entity.weaponThrottle = d < 100 ? 1 : 0;
+    // ── Flipper AI: get under → launch → reposition → repeat ─────────────────
+    // Real flipper drivers (like Hydra) try to get their fork UNDER the opponent,
+    // then fire the hydraulic arm to send them into the wall.
+
+    if (ai.phase === "reposition") {
+      // Back off after a flip so we can set up the next run
+      entity.weaponThrottle = 0;
+      ai.retreatTimer -= dt;
+      steerTo(entity, toTarget + Math.PI, trn, dt);
+      thrust(entity, -spd * 0.85, dt);
+      if (ai.retreatTimer <= 0 || d > 260) { ai.phase = "approach"; ai.phaseTimer = 0; }
+
+    } else if (ai.phase === "fire" || (d < 110 && entity.hammerCooldown <= 0)) {
+      // In contact range: drive in hard with flipper active
+      steerTo(entity, toTarget, trn * 1.4, dt);
+      thrust(entity, spd * 1.1, dt);
+      entity.weaponThrottle = 1;
+      ai.phaseTimer += dt;
+      // After a moment, reposition for another run
+      if (ai.phaseTimer > 0.55 || entity.hammerCooldown > 0.1) {
+        ai.phase = "reposition";
+        ai.retreatTimer = 1.0 + Math.random() * 0.5;
+        ai.phaseTimer = 0;
+      }
+
+    } else {
+      // Approach: close in from a slight angle to get the fork under the opponent
+      entity.weaponThrottle = 0;
+      ai.phaseTimer = 0;
+      // Slightly off-center approach so fork catches the opponent's side
+      const sideOffset = (Math.PI * 0.18) * ai.circleDir;
+      const approachAngle = d > 200 ? toTarget : toTarget + sideOffset;
+      steerTo(entity, approachAngle, trn, dt);
+      thrust(entity, spd * (d > 150 ? 1.0 : 0.8), dt);
+      if (d < 110 && entity.hammerCooldown <= 0) { ai.phase = "fire"; ai.phaseTimer = 0; }
+    }
+
   } else if (spec.drivingStyle === "opportunistic") {
     entity.weaponThrottle = 1;
     if (ai.phase === "retreat") {
@@ -760,7 +909,7 @@ function updatePlayerInput(state: GameState, entity: RobotEntity, dt: number) {
     entity.hammerState = "striking";
     entity.hammerTimer = 0.18;
     entity.hammerAngle = -Math.PI * 0.6;
-    entity.hammerCooldown = entity.spec.id === "beta" ? 2.2 : 1.6;
+    entity.hammerCooldown = entity.spec.id === "beta" ? 1.8 : 1.2;
   }
 }
 
@@ -895,8 +1044,8 @@ export function updateGame(state: GameState, dt: number): GameState {
   updateWeapon(state.player, clampedDt);
   updateWeapon(state.opponent, clampedDt);
 
-  applyPhysics(state.player, state.arenaW, state.arenaH, clampedDt);
-  applyPhysics(state.opponent, state.arenaW, state.arenaH, clampedDt);
+  applyPhysics(state, state.player, state.arenaW, state.arenaH, clampedDt);
+  applyPhysics(state, state.opponent, state.arenaW, state.arenaH, clampedDt);
 
   checkCollision(state);
   updateDamageSmokeEffects(state, clampedDt);

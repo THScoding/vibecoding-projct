@@ -982,17 +982,22 @@ function drawRobotPanel(
     ctx.font = "8px 'Courier New', monospace";
     ctx.fillText(`WEAPON  ${Math.round(entity.weaponRPM).toLocaleString()} RPM`, x + 8, rpmY + 15);
   } else {
-    const maxCd = entity.spec.id === "beta" ? 2.2 : 1.6;
+    const isLifter = entity.spec.weaponType === "lifter";
+    const maxCd = isLifter ? 2.0 : entity.spec.id === "beta" ? 1.8 : 1.2;
     const cdPct = 1 - Math.min(1, entity.hammerCooldown / maxCd);
     const rdy = cdPct >= 1;
-    ctx.fillStyle = rdy ? "#e91e63" : "#546e7a";
-    ctx.shadowColor = rdy ? "#e91e63" : "transparent";
+    ctx.fillStyle = rdy ? (isLifter ? "#9c27b0" : "#e91e63") : "#546e7a";
+    ctx.shadowColor = rdy ? (isLifter ? "#ce93d8" : "#e91e63") : "transparent";
     ctx.shadowBlur = rdy ? 8 : 0;
     ctx.fillRect(x + 8, rpmY, (panelW - 16) * cdPct, 7);
     ctx.shadowBlur = 0;
     ctx.fillStyle = "rgba(255,255,255,0.45)";
     ctx.font = "8px 'Courier New', monospace";
-    ctx.fillText(rdy ? "HAMMER ▶ READY" : "HAMMER  CHARGING", x + 8, rpmY + 15);
+    if (isLifter) {
+      ctx.fillText(rdy ? "FLIPPER ▶ READY" : "FLIPPER CHARGING", x + 8, rpmY + 15);
+    } else {
+      ctx.fillText(rdy ? "HAMMER ▶ READY" : "HAMMER  CHARGING", x + 8, rpmY + 15);
+    }
   }
 }
 
